@@ -1,3 +1,4 @@
+import { timingSafeEqualString } from "./ids";
 import type { SignalKind } from "./protocol";
 
 export const MAX_PEERS = 2;
@@ -69,7 +70,9 @@ export function admitPeer(
   const rated = noteJoin(sweepStale(state, input.now, input.livePeerIds), input.now);
   if (!rated.ok) return { ok: false, state: rated.state, code: "rate" };
   let next = extendExpiry(rated.state, input.now, input.ttlMs);
-  const existing = input.resumeHash ? next.peers.find((peer) => peer.resumeHash === input.resumeHash) : undefined;
+  const existing = input.resumeHash
+    ? next.peers.find((peer) => timingSafeEqualString(peer.resumeHash, input.resumeHash ?? ""))
+    : undefined;
   if (existing) {
     next = {
       ...next,

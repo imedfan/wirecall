@@ -42,6 +42,10 @@ test("two peers connect with fake media and a third is refused", async () => {
   await expect(left.locator(".status")).toHaveText("На связи", { timeout: 20_000 });
   await expect(right.locator(".status")).toHaveText("На связи", { timeout: 20_000 });
   await expect.poll(async () => left.locator("video.remote").evaluate((node) => (node as HTMLVideoElement).videoWidth)).toBeGreaterThan(0);
+  await left.getByRole("button", { name: "Микрофон", exact: true }).click();
+  await expect(left.getByRole("button", { name: "Микрофон выключен", exact: true })).toHaveAttribute("aria-pressed", "true");
+  await left.getByRole("button", { name: "Камера", exact: true }).click();
+  await expect(left.getByRole("button", { name: "Камера выключена", exact: true })).toHaveAttribute("aria-pressed", "true");
   await left.screenshot({ path: `${artifacts}/wirecall-call.png` });
   const third = await browser.newPage();
   await third.goto(path);

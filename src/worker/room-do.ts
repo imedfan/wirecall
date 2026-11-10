@@ -141,18 +141,20 @@ export class RoomDurableObject extends DurableObject<Env> {
     hello: Extract<ClientMessage, { type: "hello" }>,
   ): Promise<void> {
     const ice = await this.iceServers();
-    const now = Date.now();
-    const ttlMs = ttlFromEnv(this.env);
-    let state = this.readRoom() ?? newRoom(now, Math.max(ttlMs, attachment.expiresAt - now));
-    if (attachment.expiresAt > state.expiresAt) state = { ...state, expiresAt: attachment.expiresAt };
     const resumeHash = hello.resume && isResumeToken(hello.resume) ? await sha256Hex(hello.resume) : null;
     const resumeToken = createResumeToken();
+    const newResumeHash = await sha256Hex(resumeToken);
+    const now = Date.now();
+    const ttlMs = ttlFromEnv(this.env);
+    // Hashes are ready before the read. The two-peer decision and the write stay synchronous.
+    let state = this.readRoom() ?? newRoom(now, Math.max(ttlMs, attachment.expiresAt - now));
+    if (attachment.expiresAt > state.expiresAt) state = { ...state, expiresAt: attachment.expiresAt };
     const admitted = admitPeer(state, {
       now,
       ttlMs,
       resumeHash,
       newPeerId: crypto.randomUUID(),
-      newResumeHash: await sha256Hex(resumeToken),
+      newResumeHash,
       livePeerIds: livePeers(this.ctx.getWebSockets(), ws),
     });
     if (!admitted.ok) {

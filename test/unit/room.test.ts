@@ -134,4 +134,35 @@ describe("room isolation and two-peer bound", () => {
     expect(expired.room).toBeNull();
     expect(expired.state.rooms.some((room) => room.roomId === known)).toBe(false);
   });
+
+  it("refuses admission and signaling once the room TTL has passed", () => {
+    const room = newRoom(0, 1_000);
+    const admitted = admit(room, "a", "hash-a", 500);
+    if (!admitted.ok) throw new Error("admit");
+    const late = admitPeer(admitted.state, {
+      now: admitted.state.expiresAt,
+      ttlMs: ttl,
+      resumeHash: "hash-a",
+      newPeerId: "c",
+      newResumeHash: "hash-c",
+      livePeerIds: ["a"],
+    });
+    expect(late.ok).toBe(false);
+    if (late.ok) return;
+    expect(late.code).toBe("expired");
+    expect(late.state.peers.map((peer) => peer.peerId)).toEqual(["a"]);
+    expect(late.state.expiresAt).toBe(admitted.state.expiresAt);
+    const signal = relaySignal(late.state, {
+      now: late.state.expiresAt,
+      ttlMs: ttl,
+      fromPeerId: "a",
+      kind: "offer",
+      payload: "v=0\r\noffer",
+      livePeerIds: ["a"],
+    });
+    expect(signal.ok).toBe(false);
+    if (signal.ok) return;
+    expect(signal.code).toBe("expired");
+    expect(signal.state.queued).toEqual([]);
+  });
 });
