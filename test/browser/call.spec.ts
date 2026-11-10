@@ -28,6 +28,19 @@ test("two peers connect with fake media and a third is refused", async () => {
   const right = await browser.newPage();
   watch(left);
   watch(right);
+  await left.addInitScript(() => {
+    const Original = RTCPeerConnection;
+    const pcs: RTCPeerConnection[] = [];
+    (window as unknown as { __pcs: RTCPeerConnection[] }).__pcs = pcs;
+    const Wrapped = function (config?: RTCConfiguration) {
+      const pc = new Original(config);
+      pcs.push(pc);
+      return pc;
+    } as unknown as typeof RTCPeerConnection;
+    Wrapped.prototype = Original.prototype;
+    Object.setPrototypeOf(Wrapped, Original);
+    window.RTCPeerConnection = Wrapped;
+  });
   await left.goto("/");
   await left.screenshot({ path: `${artifacts}/wirecall-home.png` });
   await left.getByRole("button", { name: "Создать ссылку" }).click();
@@ -42,6 +55,31 @@ test("two peers connect with fake media and a third is refused", async () => {
   await expect(left.locator(".status")).toHaveText("На связи", { timeout: 20_000 });
   await expect(right.locator(".status")).toHaveText("На связи", { timeout: 20_000 });
   await expect.poll(async () => left.locator("video.remote").evaluate((node) => (node as HTMLVideoElement).videoWidth)).toBeGreaterThan(0);
+  // The quality badge is on screen during the call: words and bars, announced politely to a screen reader.
+  for (const page of [left, right]) {
+    const badge = page.locator(".quality");
+    await expect(badge).toBeVisible();
+    await expect(badge).toHaveAttribute("aria-live", "polite");
+    await expect(badge.locator(".quality-text")).toHaveText("Связь хорошая");
+    await expect(badge).toHaveAttribute("data-bars", "4");
+    await expect(badge.locator(".quality-bars i")).toHaveCount(4);
+    // The other person's tier arrives over the data channel, not from a guess.
+    await expect(badge.locator(".quality-peer")).toHaveText("У собеседника связь хорошая", { timeout: 20_000 });
+  }
+  // Voice is capped and prioritised, video is limited but on.
+  const senders = await left.evaluate(async () => {
+    const pcs = (window as unknown as { __pcs: RTCPeerConnection[] }).__pcs;
+    const pc = pcs[pcs.length - 1]!;
+    const pick = (kind: string) => pc.getSenders().find((sender) => sender.track?.kind === kind);
+    return {
+      audioMax: pick("audio")?.getParameters().encodings[0]?.maxBitrate,
+      videoActive: pick("video")?.getParameters().encodings[0]?.active,
+      videoMax: pick("video")?.getParameters().encodings[0]?.maxBitrate,
+      audioHint: pick("audio")?.track?.contentHint,
+      videoHint: pick("video")?.track?.contentHint,
+    };
+  });
+  expect(senders).toEqual({ audioMax: 40_000, videoActive: true, videoMax: 1_200_000, audioHint: "speech", videoHint: "motion" });
   await left.getByRole("button", { name: "Микрофон", exact: true }).click();
   await expect(left.getByRole("button", { name: "Микрофон выключен", exact: true })).toHaveAttribute("aria-pressed", "true");
   await left.getByRole("button", { name: "Камера", exact: true }).click();
@@ -169,8 +207,8 @@ test("a rebuild happens once, keeps mute, camera and quality limits, and ignores
   await expect(left.getByRole("button", { name: "Микрофон выключен", exact: true })).toHaveAttribute("aria-pressed", "true");
   await expect(right.getByRole("button", { name: "Камера выключена", exact: true })).toHaveAttribute("aria-pressed", "true");
   // The new sender starts without limits. The current quality ceiling has to be put on it again.
-  await expect.poll(async () => (await snapshot(left)).maxBitrate).toBe(1_100_000);
-  await expect.poll(async () => (await snapshot(right)).maxBitrate).toBe(1_100_000);
+  await expect.poll(async () => (await snapshot(left)).maxBitrate).toBe(1_200_000);
+  await expect.poll(async () => (await snapshot(right)).maxBitrate).toBe(1_200_000);
 
   // The room does not pass on signals of the old generation.
   await sendRaw(left, { type: "signal", kind: "offer", payload: oldOffer, gen: oldGen });

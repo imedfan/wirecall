@@ -31,5 +31,8 @@ function videoRank(codec: CodecCap): number {
   if (mime === "video/h264" && codec.sdpFmtpLine?.includes("packetization-mode=1")) return 0;
   if (mime === "video/h264") return 1;
   if (mime === "video/vp8") return 2;
+  // Kept as a last resort for a Mac. An iPhone still picks H264, which it encodes in hardware.
+  if (mime === "video/vp9") return 3;
+  if (mime === "video/av1") return 4;
   return 99;
 }

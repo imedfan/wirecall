@@ -1,20 +1,24 @@
-import { AdaptiveController, type QualityTier } from "../shared/adaptive";
+import { AdaptiveController, TIER_ORDER, type QualityTier } from "../shared/adaptive";
 import { RetryBudget } from "../shared/backoff";
 import { preferredAudioCodecs, preferredVideoCodecs, type CodecCap } from "../shared/codecs";
 import { sanitizeIceServers, type IceServer } from "../shared/ice-servers";
 import { IceBuffer } from "../shared/ice-buffer";
 import { encodeIcePayload, parseIcePayload, PROTOCOL_VERSION } from "../shared/protocol";
 import { shouldCreateOffer, shouldIgnoreOffer, type SignalingState } from "../shared/negotiation";
-import { summarizeStats, type StatCounters, type StatReport } from "../shared/stats";
+import { summarizeStats, type StatCounters, type StatReport, type StatSummary } from "../shared/stats";
+import { encodeQualityMessage, parseQualityMessage, qualityLabel } from "../shared/quality-label";
+import { redactLogFields } from "../shared/redact";
 import { isResumeToken } from "../shared/ids";
 import { audioConstraints, type FacingMode, openCallMedia, videoConstraints } from "./open-media";
 import {
   applyMediaIntent,
   applyVideoTier,
-  describeTierChange,
   freshMediaIntent,
+  tuneAudioSender,
   toggleMediaIntent,
+  type AudioSenderControl,
   type MediaIntent,
+  type SenderParameters,
   type VideoSenderControl,
   type VideoTrackControl,
 } from "./media-intent";
@@ -29,6 +33,8 @@ export interface CallHooks {
   onEnded: (text: string) => void;
   onWaiting: (waiting: boolean) => void;
   onPhase?: (phase: CallPhase) => void;
+  /** This side's own outgoing leg, and the other person's when they report it over the data channel. */
+  onQuality?: (tier: QualityTier, peerTier: QualityTier | null) => void;
   onCameras?: (count: number) => void;
 }
 
@@ -79,6 +85,10 @@ const REBUILD_WAIT_MS = 7_000;
 const ICE_RESTART_TRIES = 2;
 const MAX_REBUILDS = 4;
 const STATS_WARMUP_MS = 8_000;
+// Four missed reports in a row: the other side's tier is unknown again, not frozen at its last value.
+const PEER_QUALITY_STALE_MS = 9_000;
+// A little more buffer than the default smooths a jittery long-distance path without a delay people notice.
+const AUDIO_JITTER_TARGET_MS = 100;
 
 export class CallSession {
   private socket: WebSocket | null = null;
@@ -121,9 +131,10 @@ export class CallSession {
   private epoch = 0;
   private intent: MediaIntent = freshMediaIntent();
   private heldVideo: VideoTrackControl | null = null;
-  private videoPaused = false;
+  private qualityChannel: RTCDataChannel | null = null;
+  private peerTier: QualityTier | null = null;
+  private peerTierAt = 0;
   private savedIce: IceServer[] = [];
-  private pauseFailureAnnounced = false;
   private listening = false;
   private networkTarget: EventTarget | null = null;
   private readonly onVisibility = (): void => {
@@ -163,6 +174,8 @@ export class CallSession {
     this.stopMedia();
     this.signalRetry.reset();
     this.rebuilds = 0;
+    // A new call judges its own link. It does not start from the weak tier the last one ended on.
+    this.quality.reset();
     this.hooks.onPhase?.("starting");
     this.hooks.onStatus("Включаем камеру и микрофон");
     const media = await openCallMedia({
@@ -286,13 +299,6 @@ export class CallSession {
     } catch {
       this.hooks.onAudioBlocked(true);
     }
-  }
-
-  async requestUpgrade(): Promise<void> {
-    const epoch = this.epoch;
-    const decision = this.quality.requestUpgrade(Date.now());
-    if (decision.changed) await this.applyTier(decision.tier, epoch);
-    if (this.isCurrent(epoch)) this.publishDiagnostics();
   }
 
   private connectSocket(): void {
@@ -502,12 +508,12 @@ export class CallSession {
     const pc = new RTCPeerConnection({ iceServers: sanitizeIceServers(iceServers) });
     this.pc = pc;
     this.pcGen = gen;
-    this.videoPaused = false;
     // The last picture of the previous connection stays on screen, dimmed by the phase, until the new one delivers.
     const incoming = new MediaStream();
     this.remoteStream = incoming;
     for (const track of this.localStream?.getTracks() ?? []) pc.addTrack(track, this.localStream!);
     this.preferCodecs(pc);
+    this.openQualityChannel(pc);
     pc.addEventListener("icecandidate", (event) => {
       if (!event.candidate || this.pc !== pc) return;
       this.sendSignal(
@@ -522,8 +528,12 @@ export class CallSession {
     });
     pc.addEventListener("track", (event) => {
       if (this.pc !== pc) return;
-      if (!incoming.getTracks().includes(event.track)) incoming.addTrack(event.track);
-      if (this.remoteVideo.srcObject !== incoming) this.remoteVideo.srcObject = incoming;
+      // The stream the other side sent keeps sound and picture on one clock. A hand-built one is the fallback.
+      const stream = event.streams[0] ?? incoming;
+      if (stream === incoming && !incoming.getTracks().includes(event.track)) incoming.addTrack(event.track);
+      this.remoteStream = stream;
+      if (this.remoteVideo.srcObject !== stream) this.remoteVideo.srcObject = stream;
+      if (event.track.kind === "audio") cushionAudio(event.receiver);
       void this.playRemote();
     });
     pc.addEventListener("iceconnectionstatechange", () => {
@@ -559,6 +569,54 @@ export class CallSession {
     this.iceRestart = false;
     this.lastRestartAt = 0;
     this.iceBuffer.reset();
+    this.qualityChannel = null;
+    this.peerTier = null;
+  }
+
+  /**
+   * A channel both sides open with the same id, so it needs no signaling of its own. It carries one thing:
+   * the name of this side's quality tier. If it never opens, the other person's tier simply stays unknown.
+   */
+  private openQualityChannel(pc: RTCPeerConnection): void {
+    try {
+      const channel = pc.createDataChannel("quality", { negotiated: true, id: 0 });
+      this.qualityChannel = channel;
+      channel.addEventListener("message", (event) => {
+        if (this.pc !== pc) return;
+        const tier = parseQualityMessage(event.data);
+        if (!tier) return;
+        this.peerTierAt = Date.now();
+        if (tier === this.peerTier) return;
+        this.peerTier = tier;
+        this.publishQuality();
+      });
+      channel.addEventListener("open", () => {
+        if (this.pc === pc) this.sendQuality();
+      });
+    } catch {
+      this.qualityChannel = null;
+    }
+  }
+
+  private sendQuality(): void {
+    const channel = this.qualityChannel;
+    if (!channel || channel.readyState !== "open") return;
+    try {
+      channel.send(encodeQualityMessage(this.quality.current()));
+    } catch {
+      // The picture and the sound do not depend on this channel.
+    }
+  }
+
+  private publishQuality(): void {
+    if (this.peerTier && Date.now() - this.peerTierAt > PEER_QUALITY_STALE_MS) this.peerTier = null;
+    this.hooks.onQuality?.(this.quality.current(), this.peerTier);
+  }
+
+  /** Voice first: a modest cap and high priority on the audio sender. The adaptation itself never touches audio. */
+  private tuneAudio(pc: RTCPeerConnection): void {
+    const sender = pc.getSenders().find((item) => item.track?.kind === "audio");
+    if (sender) void tuneAudioSender(asAudioSender(sender));
   }
 
   private clearRemote(): void {
@@ -836,7 +894,9 @@ export class CallSession {
         this.connectedAt = Date.now();
         // A rebuilt connection starts with default encodings. The current ceiling is applied again.
         void this.applyTier(this.quality.current(), epoch);
+        if (this.pc) this.tuneAudio(this.pc);
       }
+      this.publishQuality();
       return;
     }
     // A running recovery owns the status line: it may be waiting for the room or for the other person.
@@ -912,50 +972,64 @@ export class CallSession {
       this.publishDiagnostics(summary);
       return;
     }
+    const before = this.quality.current();
     const decision = this.quality.observe({
       atMs: Date.now(),
       rttMs: summary.rttMs,
       lossRatio: summary.lossRatio,
+      inboundLossRatio: summary.inboundLossRatio,
+      jitterMs: summary.jitterMs,
       availableOutgoingBitrate: summary.availableOutgoingBitrate,
+      framesDroppedRatio: summary.framesDroppedRatio,
+      encoderLimit: summary.encoderLimit,
     });
-    const mismatch = decision.tier === "audio-only" ? !this.videoPaused : this.videoPaused;
-    if (decision.changed || mismatch) await this.applyTier(decision.tier, epoch);
-    if (!this.isCurrent(epoch)) return;
+    if (decision.changed) {
+      await this.applyTier(decision.tier, epoch);
+      if (!this.isCurrent(epoch)) return;
+      // A fresh key frame lets the smaller picture appear at once instead of smearing in.
+      if (TIER_ORDER.indexOf(decision.tier) < TIER_ORDER.indexOf(before)) requestKeyFrame(this.videoSender());
+    }
+    this.sendQuality();
+    this.publishQuality();
     this.publishDiagnostics(summary);
   }
 
+  /** Limits outgoing video to the tier. It never stops the video: that is the camera button's job alone. */
   private async applyTier(tier: QualityTier, epoch: number): Promise<void> {
     const sender = this.videoSender();
-    if (!this.isCurrent(epoch)) return;
-    const result = sender
-      ? await applyVideoTier(asVideoSender(sender), tier, this.intent, this.heldVideo)
-      : tier === "audio-only" && !this.heldVideo
-        ? { videoPaused: true, applied: true }
-        : null;
-    if (!result || !this.isCurrent(epoch)) return;
-    const next = describeTierChange({
-      tier,
-      previousPaused: this.videoPaused,
-      failureAnnounced: this.pauseFailureAnnounced,
-      result,
-    });
-    this.videoPaused = next.videoPaused;
-    this.pauseFailureAnnounced = next.failureAnnounced;
-    if (next.status) this.hooks.onStatus(next.status);
+    if (!sender || !this.isCurrent(epoch)) return;
+    await applyVideoTier(asVideoSender(sender), tier, this.intent);
   }
 
-  private publishDiagnostics(summary?: { rttMs?: number; lossRatio?: number; framesPerSecond?: number; width?: number; height?: number; bitrate?: number }): void {
+  private publishDiagnostics(summary?: StatSummary): void {
     const tier = this.quality.current();
-    this.hooks.onDiagnostics([
+    const score = this.quality.score();
+    const percent = (value: number | undefined): string => (value === undefined ? "неизвестно" : `${Math.round(value * 1000) / 10}%`);
+    const ms = (value: number | undefined): string => (value === undefined ? "неизвестно" : `${value} мс`);
+    const kbit = (value: number | undefined): string => (value === undefined ? "неизвестно" : `${Math.round(value / 1000)} кбит/с`);
+    const lines = [
+      `Качество: ${tierLabel(tier)}`,
+      `Оценка связи: ${score === null ? "неизвестно" : `${score} из 100`}`,
+      `У собеседника: ${this.peerTier ? tierLabel(this.peerTier) : "неизвестно"}`,
       `Маршрут: ${this.route}`,
       `Релей: ${this.turnMode === "on" ? "включён" : this.turnMode === "error" ? "не ответил, только прямое" : "выключен"}`,
-      `Задержка: ${summary?.rttMs === undefined ? "неизвестно" : `${summary.rttMs} мс`}`,
-      `Потери: ${summary?.lossRatio === undefined ? "неизвестно" : `${Math.round(summary.lossRatio * 1000) / 10}%`}`,
+      `Задержка: ${ms(summary?.rttMs)}`,
+      `Потери: ${percent(summary?.lossRatio)}`,
+      `Потери на приёме: ${percent(summary?.inboundLossRatio)}`,
+      `Джиттер: ${ms(summary?.jitterMs)}`,
+      `Битрейт: ${kbit(summary?.bitrate)}`,
+      `Доступная полоса: ${kbit(summary?.availableOutgoingBitrate)}`,
+      `Ограничение кодера: ${limitLabel(summary?.encoderLimit)}`,
       `Кадры: ${summary?.framesPerSecond === undefined ? "неизвестно" : String(Math.round(summary.framesPerSecond))}`,
       `Размер: ${summary?.width && summary?.height ? `${summary.width}×${summary.height}` : "неизвестно"}`,
-      `Битрейт: ${summary?.bitrate === undefined ? "неизвестно" : `${Math.round(summary.bitrate / 1000)} кбит/с`}`,
-      `Качество: ${this.videoPaused ? "только звук" : this.quality.current() === "audio-only" ? "видео не снижено" : tierLabel(tier)}`,
-    ]);
+      `Пропущенные кадры: ${percent(summary?.framesDroppedRatio)}`,
+      `Восполнение звука: ${percent(summary?.concealmentRatio)}`,
+    ];
+    this.hooks.onDiagnostics(lines);
+    if (debugEnabled()) {
+      // Numbers and tier names only. The same filter as the server logs drops anything that could carry SDP, ICE or a token.
+      console.debug("wirecall", redactLogFields({ tier, score, peerTier: this.peerTier, route: this.route, ...numbersOf(summary) }));
+    }
   }
 
   private async onForeground(): Promise<void> {
@@ -1016,6 +1090,12 @@ export class CallSession {
 
   /** A track ends when headphones disconnect or iOS takes the camera away. It is reopened once the page is visible. */
   private watchTrack(track: MediaStreamTrack): void {
+    // Tells the encoder what matters: clear speech for the microphone, smooth motion for a face.
+    try {
+      track.contentHint = track.kind === "audio" ? "speech" : "motion";
+    } catch {
+      // Not every browser has the hint.
+    }
     track.addEventListener?.("ended", () => {
       if (document.visibilityState === "visible") void this.restoreTracks();
     });
@@ -1104,7 +1184,7 @@ export class CallSession {
   }
 
   private videoSender(): RTCRtpSender | undefined {
-    return this.pc?.getSenders().find((item) => item.track?.kind === "video" || (item.track === null && this.heldVideo !== null));
+    return this.pc?.getSenders().find((item) => item.track?.kind === "video");
   }
 
   private finish(text: string, notifyServer: boolean): void {
@@ -1126,7 +1206,7 @@ export class CallSession {
   }
 
   private linkStatus(): string {
-    return this.videoPaused ? "На связи, только звук" : "На связи";
+    return "На связи";
   }
 
   private stopMedia(): void {
@@ -1135,7 +1215,6 @@ export class CallSession {
     this.localStream = null;
     this.localVideo.srcObject = null;
     this.heldVideo = null;
-    this.videoPaused = false;
     const lock = this.wakeLock;
     this.wakeLock = null;
     void lock?.release();
@@ -1167,10 +1246,57 @@ function asVideoSender(sender: RTCRtpSender): VideoSenderControl {
     get track() {
       return sender.track as VideoTrackControl | null;
     },
-    getParameters: () => sender.getParameters(),
-    setParameters: (params) => sender.setParameters(params as RTCRtpSendParameters),
-    replaceTrack: (track) => sender.replaceTrack(track as MediaStreamTrack | null),
+    getParameters: () => sender.getParameters() as unknown as SenderParameters,
+    setParameters: (params) => sender.setParameters(params as unknown as RTCRtpSendParameters),
   };
+}
+
+function asAudioSender(sender: RTCRtpSender): AudioSenderControl {
+  return {
+    getParameters: () => sender.getParameters() as unknown as SenderParameters,
+    setParameters: (params) => sender.setParameters(params as unknown as RTCRtpSendParameters),
+  };
+}
+
+function requestKeyFrame(sender: RTCRtpSender | undefined): void {
+  const generate = (sender as (RTCRtpSender & { generateKeyFrame?: () => Promise<unknown> }) | undefined)?.generateKeyFrame;
+  if (!sender || typeof generate !== "function") return;
+  try {
+    void generate.call(sender).catch(() => undefined);
+  } catch {
+    // The encoder sends a key frame by itself soon enough.
+  }
+}
+
+function cushionAudio(receiver: RTCRtpReceiver): void {
+  const target = receiver as unknown as Record<string, unknown>;
+  try {
+    if ("jitterBufferTarget" in target) target.jitterBufferTarget = AUDIO_JITTER_TARGET_MS;
+    else if ("playoutDelayHint" in target) target.playoutDelayHint = AUDIO_JITTER_TARGET_MS / 1000;
+  } catch {
+    // The browser keeps its own buffer.
+  }
+}
+
+function debugEnabled(): boolean {
+  try {
+    return localStorage.getItem("wirecall-debug") === "1";
+  } catch {
+    return false;
+  }
+}
+
+function numbersOf(summary: StatSummary | undefined): Record<string, unknown> {
+  if (!summary) return {};
+  return Object.fromEntries(Object.entries(summary).filter(([key]) => key !== "counters" && key !== "route"));
+}
+
+function limitLabel(limit: StatSummary["encoderLimit"]): string {
+  if (limit === undefined) return "неизвестно";
+  if (limit === "none") return "нет";
+  if (limit === "bandwidth") return "полоса";
+  if (limit === "cpu") return "процессор";
+  return "другое";
 }
 
 function rtcCapabilities(kind: "audio" | "video"): CodecCap[] {
@@ -1209,10 +1335,7 @@ function writeToken(key: string, value: string): void {
 }
 
 function tierLabel(tier: QualityTier): string {
-  if (tier === "high") return "высокое";
-  if (tier === "medium") return "обычное";
-  if (tier === "low") return "экономия";
-  return "только звук";
+  return qualityLabel(tier).replace(/^Связь /u, "");
 }
 
 function mediaIssueText(reason: "denied" | "missing" | "busy" | "failed"): string {

@@ -1,4 +1,6 @@
 import { isRoomId } from "../shared/ids";
+import { START_TIER, type QualityTier } from "../shared/adaptive";
+import { qualityBadge } from "../shared/quality-label";
 import { CallSession } from "./call-session";
 
 const app = document.querySelector<HTMLElement>("#app");
@@ -159,16 +161,42 @@ function renderCall(root: HTMLElement, roomId: string): void {
   retry.hidden = true;
   const share = button(canShare() ? "Отправить ссылку" : "Скопировать ссылку");
   share.classList.add("ghost", "share");
-  const upgrade = button("Вернуть видео");
-  upgrade.classList.add("ghost", "upgrade");
-  upgrade.hidden = true;
   const notice = document.createElement("p");
   notice.className = "hint notice";
   notice.hidden = true;
   const hint = document.createElement("p");
   hint.className = "hint lobby-hint";
   hint.textContent = "Safari не держит звонок в фоне как телефон. Если закрыть экран или уйти в другое приложение, картинка и звук остановятся, пока вы не вернётесь.";
-  center.append(status, join, issue, audio, retry, share, notice, hint);
+  // The badge is always on screen during a call: bars plus words, so the meaning never rests on colour alone.
+  const quality = document.createElement("p");
+  quality.className = "quality";
+  quality.setAttribute("role", "status");
+  quality.setAttribute("aria-live", "polite");
+  quality.setAttribute("aria-atomic", "true");
+  const bars = document.createElement("span");
+  bars.className = "quality-bars";
+  bars.setAttribute("aria-hidden", "true");
+  for (let index = 0; index < 4; index += 1) bars.append(document.createElement("i"));
+  const qualityWords = document.createElement("span");
+  qualityWords.className = "quality-words";
+  const qualityText = document.createElement("span");
+  qualityText.className = "quality-text";
+  const peerText = document.createElement("span");
+  peerText.className = "quality-peer";
+  peerText.hidden = true;
+  qualityWords.append(qualityText, peerText);
+  quality.append(bars, qualityWords);
+  const showQuality = (tier: QualityTier, peerTier: QualityTier | null): void => {
+    const badge = qualityBadge(tier, peerTier);
+    quality.dataset.tier = tier;
+    quality.dataset.bars = String(badge.bars);
+    if (qualityText.textContent !== badge.text) qualityText.textContent = badge.text;
+    const peer = badge.peerText ?? "";
+    if (peerText.textContent !== peer) peerText.textContent = peer;
+    peerText.hidden = badge.peerText === null;
+  };
+  showQuality(START_TIER, null);
+  center.append(status, quality, join, issue, audio, retry, share, notice, hint);
 
   const controls = document.createElement("div");
   controls.className = "controls";
@@ -196,7 +224,7 @@ function renderCall(root: HTMLElement, roomId: string): void {
   dialog.addEventListener("click", (event) => {
     if (event.target === dialog) dialog.close();
   });
-  page.append(stage, upgrade, center, controls, dialog);
+  page.append(stage, center, controls, dialog);
   root.replaceChildren(page);
   // The call screen is always dark. Safari tints its bars to match instead of the paper colour of the home page.
   for (const meta of document.querySelectorAll('meta[name="theme-color"]')) meta.setAttribute("content", "#0f0e0c");
@@ -236,7 +264,6 @@ function renderCall(root: HTMLElement, roomId: string): void {
           row.append(name, value);
           return row;
         }));
-        upgrade.hidden = !lines.some((line) => line.includes("только звук") || line.includes("экономия"));
       },
       onAudioBlocked: (blocked) => {
         audio.hidden = !blocked;
@@ -249,7 +276,6 @@ function renderCall(root: HTMLElement, roomId: string): void {
         status.textContent = text;
         join.textContent = "Войти снова";
         audio.hidden = true;
-        upgrade.hidden = true;
         if (dialog.open) dialog.close();
       },
       onWaiting: (waiting) => {
@@ -259,6 +285,7 @@ function renderCall(root: HTMLElement, roomId: string): void {
         page.dataset.phase = phase;
         retry.hidden = phase !== "trouble";
       },
+      onQuality: showQuality,
       onCameras: (count) => {
         flip.hidden = count < 2;
       },
@@ -290,9 +317,6 @@ function renderCall(root: HTMLElement, roomId: string): void {
   cam.addEventListener("click", toggleCam);
   flip.addEventListener("click", () => {
     if (session) void session.switchCamera();
-  });
-  upgrade.addEventListener("click", () => {
-    if (session) void session.requestUpgrade();
   });
   end.addEventListener("click", () => {
     if (session) session.hangup();
