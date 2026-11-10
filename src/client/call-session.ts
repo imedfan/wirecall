@@ -72,6 +72,7 @@ export class CallSession {
   private intent: MediaIntent = freshMediaIntent();
   private heldVideo: VideoTrackControl | null = null;
   private videoPaused = false;
+  private savedIce: IceServer[] = [];
   private pauseFailureAnnounced = false;
   private listening = false;
   private networkTarget: EventTarget | null = null;
@@ -276,7 +277,16 @@ export class CallSession {
     }
     if (message.type === "peer-reset") {
       this.peerCount = typeof message.peerCount === "number" ? message.peerCount : 2;
-      this.resetPeerConnection();
+      this.hooks.onWaiting(false);
+      this.hooks.onStatus("Соединяем снова");
+      this.resetPeerConnection(this.savedIce);
+      if (!this.isCurrent(epoch)) return;
+      const early = this.earlySignals;
+      this.earlySignals = [];
+      for (const signal of early) {
+        if (!this.isCurrent(epoch)) return;
+        await this.applySignal(signal.kind, signal.payload);
+      }
       if (!this.isCurrent(epoch)) return;
       await this.negotiate();
       return;
@@ -295,6 +305,7 @@ export class CallSession {
     this.polite = welcome.polite;
     this.peerCount = welcome.peerCount;
     this.turnMode = welcome.turnMode;
+    this.savedIce = welcome.iceServers;
     if (welcome.resumeToken && isResumeToken(welcome.resumeToken)) {
       sessionStorage.setItem(this.resumeKey(), welcome.resumeToken);
     }
@@ -338,8 +349,12 @@ export class CallSession {
       if (!this.remoteStream.getTracks().includes(event.track)) this.remoteStream.addTrack(event.track);
       void this.playRemote();
     });
-    pc.addEventListener("iceconnectionstatechange", () => this.onIceState(pc.iceConnectionState));
+    pc.addEventListener("iceconnectionstatechange", () => {
+      if (this.pc !== pc) return;
+      this.onIceState(pc.iceConnectionState);
+    });
     pc.addEventListener("connectionstatechange", () => {
+      if (this.pc !== pc) return;
       if (pc.connectionState === "connected") {
         this.iceRetry.reset();
         this.hooks.onWaiting(false);
@@ -349,8 +364,9 @@ export class CallSession {
   }
 
   private resetPeerConnection(iceServers?: IceServer[]): void {
-    this.pc?.close();
+    const previous = this.pc;
     this.pc = null;
+    previous?.close();
     this.iceBuffer.reset();
     this.remoteStream = new MediaStream();
     this.remoteVideo.srcObject = this.remoteStream;
@@ -375,7 +391,7 @@ export class CallSession {
     const pc = this.pc;
     const epoch = this.epoch;
     if (!this.isCurrent(epoch) || !pc || this.peerCount < 2 || this.makingOffer || pc.signalingState !== "stable") return;
-    if (!shouldCreateOffer({ polite: this.polite, iceRestart: this.iceRestart })) return;
+    if (!shouldCreateOffer({ polite: this.polite })) return;
     this.makingOffer = true;
     try {
       const offer = await pc.createOffer({ iceRestart: this.iceRestart });
@@ -453,7 +469,7 @@ export class CallSession {
       this.hooks.onStatus(this.linkStatus());
       return;
     }
-    if (Date.now() < this.iceGraceUntil && state !== "failed") return;
+    if (Date.now() < this.iceGraceUntil && state !== "failed" && state !== "disconnected") return;
     if (state === "failed") {
       this.scheduleIceRestart();
       return;

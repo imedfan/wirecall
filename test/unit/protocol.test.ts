@@ -43,9 +43,8 @@ describe("signaling validation", () => {
     expect(buffer.push("two")).toEqual(["two"]);
     buffer.reset();
     expect(buffer.push("three")).toEqual([]);
-    expect(shouldCreateOffer({ polite: true, iceRestart: false })).toBe(false);
-    expect(shouldCreateOffer({ polite: true, iceRestart: true })).toBe(true);
-    expect(shouldCreateOffer({ polite: false, iceRestart: false })).toBe(true);
+    expect(shouldCreateOffer({ polite: true })).toBe(false);
+    expect(shouldCreateOffer({ polite: false })).toBe(true);
     expect(shouldIgnoreOffer({ polite: false, makingOffer: true, signalingState: "have-local-offer", descriptionType: "offer" })).toBe(true);
     expect(shouldIgnoreOffer({ polite: true, makingOffer: true, signalingState: "have-local-offer", descriptionType: "offer" })).toBe(false);
     expect(shouldIgnoreOffer({ polite: false, makingOffer: false, signalingState: "stable", descriptionType: "answer" })).toBe(false);

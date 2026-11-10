@@ -15,6 +15,8 @@ import {
 import { logEvent } from "./log";
 import { fetchTurnIceServers, turnRequested } from "./turn";
 
+const notedCloses = new WeakSet<WebSocket>();
+
 interface SocketAttachment {
   role: "pending" | "peer";
   peerId?: string;
@@ -102,16 +104,17 @@ export class RoomDurableObject extends DurableObject<Env> {
   }
 
   async webSocketClose(ws: WebSocket): Promise<void> {
+    if (notedCloses.has(ws)) return;
+    notedCloses.add(ws);
     const attachment = readAttachment(ws);
     if (attachment.role !== "peer" || !attachment.peerId) return;
     if (replacedByNewerSocket(this.ctx.getWebSockets(), attachment.peerId, ws)) return;
     const state = this.readRoom();
-    if (!state) return;
-    const result = leavePeer(state, attachment.peerId);
-    this.writeRoom(result.state);
-    if (result.removed) this.sendToPeers({ type: "peer-left", peerCount: result.peerCount }, attachment.peerId);
-    logEvent("peer-left", { peers: result.peerCount });
-    await this.schedule(result.state);
+    if (!state || !state.peers.some((peer) => peer.peerId === attachment.peerId)) return;
+    // The seat and resume hash stay so the same person can hello again. Hangup and the stale sweep remove it.
+    this.sendToPeers({ type: "peer-left", peerCount: state.peers.length }, attachment.peerId);
+    if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CLOSING) ws.close(1001, "dropped");
+    logEvent("socket-closed", { peers: state.peers.length });
   }
 
   async webSocketError(ws: WebSocket): Promise<void> {
@@ -164,9 +167,10 @@ export class RoomDurableObject extends DurableObject<Env> {
       logEvent("admit-rejected", { code: admitted.code });
       return;
     }
-    this.writeRoom(admitted.state);
-    if (admitted.resumed) closeOtherSockets(this.ctx.getWebSockets(), admitted.peerId, ws);
+    const room = admitted.resumed ? { ...admitted.state, queued: [] } : admitted.state;
+    this.writeRoom(room);
     ws.serializeAttachment({ ...attachment, role: "peer", peerId: admitted.peerId });
+    if (admitted.resumed) closeOtherSockets(this.ctx.getWebSockets(), admitted.peerId, ws);
     this.send(ws, {
       type: "welcome",
       protocol: 1,
@@ -184,7 +188,9 @@ export class RoomDurableObject extends DurableObject<Env> {
     } else if (admitted.notify === "reset") {
       this.sendToPeers({ type: "peer-reset", peerCount: admitted.peerCount }, admitted.peerId);
     }
-    for (const signal of admitted.flush) this.send(ws, signalMessage(signal));
+    if (!admitted.resumed) {
+      for (const signal of admitted.flush) this.send(ws, signalMessage(signal));
+    }
     logEvent("peer-joined", { peers: admitted.peerCount, resumed: admitted.resumed, turnMode: ice.mode });
     await this.schedule(admitted.state);
     this.touchIndex(attachment.roomId, admitted.expiresAt, true);
