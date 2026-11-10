@@ -8,8 +8,13 @@ export function preferredVideoCodecs(available: readonly CodecCap[]): CodecCap[]
     .map((codec) => ({ codec, rank: videoRank(codec) }))
     .filter((entry) => entry.rank < 99)
     .sort((left, right) => left.rank - right.rank);
-  return ranked.map((entry) => entry.codec);
+  if (ranked.length === 0) return [];
+  // Without rtx/red/ulpfec the browser loses retransmission and bandwidth probing on lossy links.
+  const repair = available.filter((codec) => REPAIR_MIMES.has(codec.mimeType.toLowerCase()));
+  return [...ranked.map((entry) => entry.codec), ...repair];
 }
+
+const REPAIR_MIMES = new Set(["video/rtx", "video/red", "video/ulpfec", "video/flexfec-03"]);
 
 export function preferredAudioCodecs(available: readonly CodecCap[]): CodecCap[] {
   const opusIndex = available.findIndex((codec) => codec.mimeType.toLowerCase() === "audio/opus");

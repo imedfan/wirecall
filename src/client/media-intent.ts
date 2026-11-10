@@ -73,18 +73,17 @@ export async function applyVideoTier(
   const profile = TIER_PROFILES[tier];
   const height = (sender.track ?? heldVideo)?.getSettings().height;
   try {
+    // setParameters only accepts the object getParameters returned (transactionId, codecs), with fields changed in place.
     const params = sender.getParameters();
-    const current = params.encodings[0] ?? {};
-    await sender.setParameters({
-      encodings: [{
-        ...current,
-        active: true,
-        maxBitrate: profile.maxBitrate,
-        maxFramerate: profile.maxFramerate,
-        scaleResolutionDownBy: scaleForHeight(height, tier),
-      }],
-      degradationPreference: "balanced",
-    });
+    params.encodings[0] = {
+      ...(params.encodings[0] ?? {}),
+      active: true,
+      maxBitrate: profile.maxBitrate,
+      maxFramerate: profile.maxFramerate,
+      scaleResolutionDownBy: scaleForHeight(height, tier),
+    };
+    params.degradationPreference = "balanced";
+    await sender.setParameters(params);
     const active = sender.getParameters().encodings[0]?.active;
     if (active !== false) {
       const track = sender.track ?? heldVideo;
@@ -117,8 +116,8 @@ async function pauseVideo(
 ): Promise<VideoTierResult> {
   try {
     const params = sender.getParameters();
-    const current = params.encodings[0] ?? {};
-    await sender.setParameters({ encodings: [{ ...current, active: false }], degradationPreference: params.degradationPreference });
+    params.encodings[0] = { ...(params.encodings[0] ?? {}), active: false };
+    await sender.setParameters(params);
     if (sender.getParameters().encodings[0]?.active === false) {
       if (heldVideo) applyMediaIntent(heldVideo, intent);
       return { videoPaused: true, applied: true };

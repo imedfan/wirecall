@@ -1,7 +1,7 @@
 import { expect, test, chromium, type Browser, type Page } from "@playwright/test";
 import { mkdir, writeFile } from "node:fs/promises";
 
-const artifacts = "/opt/cursor/artifacts";
+const artifacts = process.env.WIRECALL_ARTIFACTS ?? "test-results/artifacts";
 
 async function launch(): Promise<Browser> {
   return chromium.launch({
@@ -102,6 +102,42 @@ test("the same participant reconnects without a new seat", async () => {
   await browser.close();
 });
 
+test("hanging up and joining again reconnects from either role, and so does a reload", async () => {
+  const browser = await launch();
+  const left = await browser.newPage();
+  const right = await browser.newPage();
+  await left.goto("/");
+  await left.getByRole("button", { name: "Создать ссылку" }).click();
+  const href = await left.locator(".link-box").innerText();
+  const path = new URL(href).pathname;
+  await left.goto(path);
+  await right.goto(path);
+  await left.getByRole("button", { name: "Войти в звонок" }).click();
+  await expect(left.locator(".status")).toContainText("Ждём");
+  await right.getByRole("button", { name: "Войти в звонок" }).click();
+  const live = async () => {
+    await expect(left.locator(".status")).toHaveText("На связи", { timeout: 25_000 });
+    await expect(right.locator(".status")).toHaveText("На связи", { timeout: 25_000 });
+    for (const page of [left, right]) {
+      await expect.poll(async () => page.locator("video.remote").evaluate((node) => (node as HTMLVideoElement).videoWidth)).toBeGreaterThan(0);
+    }
+  };
+  await live();
+  // The first to join is the only one allowed to offer. When that person leaves and returns, someone must still offer.
+  for (const [page, other] of [[left, right], [right, left]] as const) {
+    await page.getByRole("button", { name: "Завершить" }).click();
+    await expect(page.locator(".status")).toHaveText("Звонок завершён");
+    await expect(other.locator(".status")).toContainText("вышел");
+    await page.getByRole("button", { name: "Войти снова" }).click();
+    await live();
+  }
+  await left.reload();
+  await expect(right.locator(".status")).toContainText("вышел");
+  await left.getByRole("button", { name: "Войти в звонок" }).click();
+  await live();
+  await browser.close();
+});
+
 async function armSockets(page: Page): Promise<void> {
   await page.addInitScript(() => {
     const sockets: WebSocket[] = [];
@@ -180,7 +216,9 @@ test("permission failure shows recovery guidance", async () => {
   const href = await page.locator(".link-box").innerText();
   await page.goto(new URL(href).pathname);
   await page.getByRole("button", { name: "Войти в звонок" }).click();
-  await expect(page.locator(".media-issue")).toContainText("не показало камеру или микрофон");
+  // Headless Chromium reports no devices on Linux and "not supported" on macOS. Both must end in visible guidance.
+  await expect(page.locator(".media-issue")).toContainText(/камер/u);
+  await expect(page.getByRole("button", { name: "Войти в звонок" })).toBeVisible();
   await page.screenshot({ path: `${artifacts}/wirecall-permission.png` });
   await browser.close();
 });

@@ -91,7 +91,8 @@ export function admitPeer(
     };
   }
   if (next.peers.length >= MAX_PEERS) return { ok: false, state: next, code: "room-full" };
-  const polite = next.peers.length === 1;
+  // Exactly one side may offer. A newcomer takes whichever role the remaining peer does not hold.
+  const polite = next.peers.some((peer) => !peer.polite);
   const peer: PeerRecord = {
     peerId: input.newPeerId,
     resumeHash: input.newResumeHash,
@@ -99,7 +100,8 @@ export function admitPeer(
     joinedAt: input.now,
     lastSeen: input.now,
   };
-  next = { ...next, peers: [...next.peers, peer] };
+  // Signals queued before this join belong to a connection the newcomer never saw. Replaying them breaks the fresh one.
+  next = { ...next, peers: [...next.peers, peer], queued: [] };
   return {
     ok: true,
     state: next,
@@ -108,7 +110,7 @@ export function admitPeer(
     resumed: false,
     peerCount: next.peers.length,
     expiresAt: next.expiresAt,
-    flush: next.queued,
+    flush: [],
     notify: next.peers.length === 2 ? "joined" : "none",
   };
 }

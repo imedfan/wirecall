@@ -26,9 +26,7 @@ export interface StatSummary {
 }
 
 export function summarizeStats(reports: readonly StatReport[], previous: StatCounters | undefined, nowMs: number): StatSummary {
-  const pair = reports.find(
-    (report) => report.type === "candidate-pair" && (report.nominated === true || report.selected === true),
-  );
+  const pair = selectedPair(reports);
   const local = pair ? reports.find((report) => report.id === pair.localCandidateId) : undefined;
   const outbound = reports.find((report) => report.type === "outbound-rtp" && report.kind === "video" && report.isRemote !== true);
   const remoteInbound = reports.find((report) => report.type === "remote-inbound-rtp" && report.kind === "video");
@@ -59,4 +57,17 @@ export function summarizeStats(reports: readonly StatReport[], previous: StatCou
     availableOutgoingBitrate: readStatNumber(pair?.availableOutgoingBitrate),
     counters: { atMs: nowMs, bytesSent, packetsSent, packetsLost },
   };
+}
+
+function selectedPair(reports: readonly StatReport[]): StatReport | undefined {
+  // After an ICE restart several pairs stay nominated. The transport names the one in use.
+  const transport = reports.find((report) => report.type === "transport" && typeof report.selectedCandidatePairId === "string");
+  const named = transport ? reports.find((report) => report.type === "candidate-pair" && report.id === transport.selectedCandidatePairId) : undefined;
+  if (named) return named;
+  const pairs = reports.filter((report) => report.type === "candidate-pair");
+  return (
+    pairs.find((report) => report.selected === true) ??
+    pairs.find((report) => report.nominated === true && report.state === "succeeded") ??
+    pairs.find((report) => report.nominated === true)
+  );
 }

@@ -4,7 +4,7 @@ import { TURN_CREDENTIAL_TTL_SECONDS, turnCredentialTarget } from "../../src/sha
 
 describe("TURN credential request bounds", () => {
   it("builds one fixed Cloudflare URL and rejects a key that could change the path", () => {
-    expect(TURN_CREDENTIAL_TTL_SECONDS).toBe(3600);
+    expect(TURN_CREDENTIAL_TTL_SECONDS).toBe(86_400);
     expect(turnCredentialTarget("abcd1234")).toBe(
       "https://rtc.live.cloudflare.com/v1/turn/keys/abcd1234/credentials/generate-ice-servers",
     );
