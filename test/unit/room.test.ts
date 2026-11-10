@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { createIndexedRoom, emptyIndex, lookupRoom } from "../../src/shared/room-index-state";
-import { admitPeer, leavePeer, newRoom, relaySignal, touchPeer } from "../../src/shared/room-state";
+import { admitPeer, leavePeer, newRoom, rebuildRoom, relaySignal, touchPeer } from "../../src/shared/room-state";
 import { createRoomId } from "../../src/shared/ids";
 
 const ttl = 60_000;
@@ -68,9 +68,55 @@ describe("room isolation and two-peer bound", () => {
     if (!resumed.ok) return;
     expect(resumed.peerId).toBe("a");
     expect(resumed.resumed).toBe(true);
-    expect(resumed.notify).toBe("reset");
+    expect(resumed.notify).toBe("back");
+    // No generation named: this peer lost its connection, so both sides must start a new one.
+    expect(resumed.kept).toBe(false);
+    expect(resumed.gen).toBe(second.gen + 1);
     expect(resumed.state.peers).toHaveLength(2);
     expect(resumed.state.peers.find((peer) => peer.peerId === "a")?.resumeHash).toBe("hash-a2");
+  });
+
+  it("keeps the generation for a peer that still holds its connection and starts a new one otherwise", () => {
+    const first = admit(newRoom(0, ttl), "a", "hash-a");
+    if (!first.ok) throw new Error("admit");
+    const second = admit(first.state, "b", "hash-b");
+    if (!second.ok) throw new Error("admit");
+    expect(second.gen).toBeGreaterThan(first.gen);
+    const resume = (state: typeof second.state, hash: string, next: string, keepGen: number | null) =>
+      admitPeer(state, { now: 3_000, ttlMs: ttl, resumeHash: hash, newPeerId: "x", newResumeHash: next, livePeerIds: ["b"], keepGen });
+    // Only the socket dropped: same generation, nobody rebuilds.
+    const kept = resume(second.state, "hash-a", "hash-a2", second.gen);
+    if (!kept.ok) throw new Error("resume");
+    expect(kept.kept).toBe(true);
+    expect(kept.gen).toBe(second.gen);
+    expect(kept.notify).toBe("back");
+    // The peer names a generation the room has already left behind.
+    const moved = rebuildRoom(kept.state, kept.gen);
+    expect(moved.bumped).toBe(true);
+    const late = resume(moved.state, "hash-a2", "hash-a3", kept.gen);
+    if (!late.ok) throw new Error("resume");
+    expect(late.kept).toBe(false);
+    expect(late.gen).toBe(moved.state.gen + 1);
+  });
+
+  it("rebuilds once when both peers ask at the same moment and drops signals of an old generation", () => {
+    const first = admit(newRoom(0, ttl), "a", "hash-a");
+    if (!first.ok) throw new Error("admit");
+    const second = admit(first.state, "b", "hash-b");
+    if (!second.ok) throw new Error("admit");
+    const gen = second.gen;
+    const one = rebuildRoom(second.state, gen);
+    const two = rebuildRoom(one.state, gen);
+    expect(one.bumped).toBe(true);
+    expect(two.bumped).toBe(false);
+    expect(two.state.gen).toBe(gen + 1);
+    const signal = (signalGen: number) =>
+      relaySignal(two.state, { now: 2_000, ttlMs: ttl, fromPeerId: "a", kind: "offer", payload: "v=0\r\n", livePeerIds: ["a", "b"], gen: signalGen });
+    const stale = signal(gen);
+    expect(stale.ok && stale.stale).toBe(true);
+    expect(stale.ok && stale.toPeerIds).toEqual([]);
+    const fresh = signal(gen + 1);
+    expect(fresh.ok && fresh.toPeerIds).toEqual(["b"]);
   });
 
   it("gives a newcomer the role the remaining peer does not hold", () => {

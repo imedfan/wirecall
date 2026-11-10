@@ -3,7 +3,7 @@ import { RetryBudget } from "../shared/backoff";
 import { preferredAudioCodecs, preferredVideoCodecs, type CodecCap } from "../shared/codecs";
 import { sanitizeIceServers, type IceServer } from "../shared/ice-servers";
 import { IceBuffer } from "../shared/ice-buffer";
-import { encodeIcePayload, parseIcePayload } from "../shared/protocol";
+import { encodeIcePayload, parseIcePayload, PROTOCOL_VERSION } from "../shared/protocol";
 import { shouldCreateOffer, shouldIgnoreOffer, type SignalingState } from "../shared/negotiation";
 import { summarizeStats, type StatCounters, type StatReport } from "../shared/stats";
 import { isResumeToken } from "../shared/ids";
@@ -42,6 +42,19 @@ interface WelcomeMessage {
   iceServers: IceServer[];
   resumeToken?: string;
   expiresAt: number;
+  gen?: number;
+  peerOnline?: boolean;
+}
+
+interface Recovery {
+  pc: RTCPeerConnection;
+  /** ICE restarts made, or confirmed by the offering side. */
+  restarts: number;
+  /** Restart requests in a row that got no ack. */
+  unacked: number;
+  awaitingAck: boolean;
+  rebuildAsked: boolean;
+  exhausted: boolean;
 }
 
 const NO_RETRY = new Set([1000, 1008, 4000, 4002, 4004]);
@@ -51,9 +64,18 @@ const PROBE_DEADLINE_MS = 4_000;
 // A browser waits 15 to 30 seconds before it calls ICE failed. A restart after 8 usually connects at once,
 // because the second STUN round goes through a NAT or VPN path the first one has already opened.
 const CONNECT_WATCH_MS = 8_000;
-const RESTART_WAIT_MS = 12_000;
-// Longer than both restart tries of the offering side, so the two sides do not rebuild at the same moment.
-const POLITE_WAIT_MS = 40_000;
+// One ICE restart is an offer, an answer, new candidates and connectivity checks. On a slow mobile link with a
+// relay that takes a few seconds. Ten leaves room for it without holding a dead call for long.
+const RESTART_WAIT_MS = 10_000;
+// The ack crosses the signaling server twice. Three seconds covers a one-second round trip with margin.
+// Longer silence means the request or the other side is lost.
+const ACK_WAIT_MS = 3_000;
+const MAX_UNACKED = 3;
+// After the answer to a restart arrives, connectivity checks on a working path finish within about a second.
+// A second trigger inside this window is the same failure seen by the other side, not a new one.
+const RESTART_SETTLE_MS = 2_000;
+// The room answers a rebuild request after fetching TURN credentials, which it bounds at four seconds.
+const REBUILD_WAIT_MS = 7_000;
 const ICE_RESTART_TRIES = 2;
 const MAX_REBUILDS = 4;
 const STATS_WARMUP_MS = 8_000;
@@ -72,7 +94,11 @@ export class CallSession {
   private socketReady = false;
   private pongTimer = 0;
   private recoverTimer = 0;
-  private recoverStep = 0;
+  private recovery: Recovery | null = null;
+  private lastRestartAt = 0;
+  /** Generation of the current RTCPeerConnection. The room and the other side must name the same one. */
+  private pcGen = -1;
+  private peerOnline = false;
   private rebuilds = 0;
   private connectTimer = 0;
   private connectedAt = 0;
@@ -113,7 +139,6 @@ export class CallSession {
     // Closing or reloading the tab frees the seat at once instead of holding it until the stale sweep.
     if (this.started && !this.closed) this.finish("Звонок завершён", true);
   };
-  private earlySignals: { kind: "offer" | "answer" | "ice"; payload: string }[] = [];
 
   constructor(
     private readonly roomId: string,
@@ -138,7 +163,6 @@ export class CallSession {
     this.stopMedia();
     this.signalRetry.reset();
     this.rebuilds = 0;
-    this.earlySignals = [];
     this.hooks.onPhase?.("starting");
     this.hooks.onStatus("Включаем камеру и микрофон");
     const media = await openCallMedia({
@@ -193,7 +217,7 @@ export class CallSession {
     return enabled;
   }
 
-  /** Rebuilds the call through the signaling server. For the «Переподключить» button. */
+  /** Starts a new connection on both sides. For the «Переподключить» button. */
   retry(): void {
     if (!this.isCurrent(this.epoch)) return;
     this.rebuilds = 0;
@@ -201,7 +225,13 @@ export class CallSession {
     this.signalRetry.reset();
     this.hooks.onPhase?.("connecting");
     this.hooks.onStatus("Соединяем заново");
-    this.reconnectSocket();
+    const pc = this.pc;
+    if (pc && this.socketReady && this.peerOnline) {
+      this.recovery = { pc, restarts: ICE_RESTART_TRIES, unacked: 0, awaitingAck: false, rebuildAsked: false, exhausted: false };
+      this.stepRecovery();
+    } else {
+      this.reconnectSocket();
+    }
   }
 
   async switchCamera(): Promise<void> {
@@ -279,8 +309,10 @@ export class CallSession {
         return;
       }
       const resume = readToken(this.resumeKey());
-      const hello: { type: "hello"; protocol: 1; resume?: string } = { type: "hello", protocol: 1 };
+      const hello: { type: "hello"; protocol: number; resume?: string; gen?: number } = { type: "hello", protocol: PROTOCOL_VERSION };
       if (resume && isResumeToken(resume)) hello.resume = resume;
+      // Naming the generation tells the room this side still holds its media connection and wants to keep it.
+      if (this.pc && this.pcGen >= 0) hello.gen = this.pcGen;
       socket.send(JSON.stringify(hello));
     });
     socket.addEventListener("message", (event) => {
@@ -316,7 +348,7 @@ export class CallSession {
     });
   }
 
-  /** Drops the current socket and joins again with the resume token. Both sides then rebuild the call. */
+  /** Drops the current socket and joins again with the resume token. The media connection stays as it is. */
   private reconnectSocket(): void {
     if (this.closed || !this.started) return;
     const previous = this.socket;
@@ -367,36 +399,47 @@ export class CallSession {
     }
     if (message.type === "peer-left") {
       this.peerCount = typeof message.peerCount === "number" ? message.peerCount : 1;
-      this.earlySignals = [];
-      this.resetPeerConnection();
+      this.peerOnline = false;
+      if (message.gone === false) {
+        // Only the other side's signaling is away. Sound and picture go directly and may be perfectly fine.
+        this.pauseRecovery();
+        if (this.pc && !iceUp(this.pc)) this.hooks.onStatus("У собеседника пропала связь. Ждём его возвращения.");
+        return;
+      }
+      this.dropConnection();
+      this.clearRemote();
       this.hooks.onWaiting(true);
       this.hooks.onStatus("Собеседник вышел. Ждём возвращения.");
       this.hooks.onPhase?.("waiting");
       return;
     }
-    if (message.type === "peer-joined" || message.type === "peer-reset") {
+    if (message.type === "peer-joined" || message.type === "peer-back" || message.type === "rebuild") {
+      const gen = generationOf(message.gen);
+      if (gen === null) return;
       this.peerCount = typeof message.peerCount === "number" ? message.peerCount : 2;
+      if (message.type !== "rebuild") this.peerOnline = true;
       this.adoptIce(message);
-      // The other side starts from a new connection. Ours must be new too, with credentials that are still valid.
-      this.resetPeerConnection(this.savedIce);
-      this.hooks.onWaiting(false);
-      this.hooks.onStatus(message.type === "peer-reset" ? "Соединяем снова" : "Соединяем");
-      this.hooks.onPhase?.("connecting");
-      const early = this.earlySignals;
-      this.earlySignals = [];
-      for (const signal of early) {
-        if (!this.isCurrent(epoch)) return;
-        await this.applySignal(signal.kind, signal.payload);
+      if (this.pc && this.pcGen === gen) {
+        // Same generation: the other side kept its connection and so does this one.
+        this.resumeLink();
+        return;
       }
-      if (!this.isCurrent(epoch)) return;
+      this.buildConnection(gen, this.savedIce);
+      this.hooks.onWaiting(false);
+      this.hooks.onStatus(message.type === "peer-joined" ? "Соединяем" : "Соединяем заново");
+      this.hooks.onPhase?.("connecting");
       await this.negotiate();
       return;
     }
+    if (message.type === "restart") {
+      if (!this.pc || message.gen !== this.pcGen) return;
+      if (message.ack === true) this.onRestartAck();
+      else this.onRestartRequest();
+      return;
+    }
     if (message.type === "signal" && typeof message.payload === "string" && (message.kind === "offer" || message.kind === "answer" || message.kind === "ice")) {
-      if (!this.pc) {
-        this.earlySignals.push({ kind: message.kind, payload: message.payload });
-        return;
-      }
+      // SDP and candidates of another generation belong to a connection that no longer exists here.
+      if (!this.pc || message.gen !== this.pcGen) return;
       await this.applySignal(message.kind, message.payload);
     }
   }
@@ -413,36 +456,60 @@ export class CallSession {
     this.socketReady = true;
     this.polite = welcome.polite;
     this.peerCount = welcome.peerCount;
+    this.peerOnline = welcome.peerOnline === true;
     this.turnMode = welcome.turnMode;
     this.savedIce = welcome.iceServers;
     if (welcome.resumeToken && isResumeToken(welcome.resumeToken)) writeToken(this.resumeKey(), welcome.resumeToken);
-    // A welcome always starts a new seat or a resumed one. The other side rebuilds in both cases.
-    this.resetPeerConnection(welcome.iceServers);
-    this.hooks.onWaiting(welcome.peerCount < 2);
-    this.hooks.onPhase?.(welcome.peerCount < 2 ? "waiting" : "connecting");
-    this.hooks.onStatus(welcome.peerCount < 2 ? "Ждём второго человека" : "Соединяем");
-    const early = this.earlySignals;
-    this.earlySignals = [];
-    for (const signal of early) {
-      if (!this.isCurrent(epoch)) return;
-      await this.applySignal(signal.kind, signal.payload);
+    const gen = generationOf(welcome.gen) ?? 0;
+    if (welcome.peerCount < 2) {
+      // Alone in the room. A connection is built when the other person arrives, with fresh ICE servers.
+      this.dropConnection();
+      this.clearRemote();
+      this.hooks.onWaiting(true);
+      this.hooks.onPhase?.("waiting");
+    } else if (this.pc && this.pcGen === gen) {
+      // Only the signaling socket was replaced. The media connection of this generation goes on untouched.
+      this.resumeLink();
+    } else {
+      this.buildConnection(gen, welcome.iceServers);
+      this.hooks.onWaiting(false);
+      this.hooks.onPhase?.("connecting");
+      await this.negotiate();
     }
     if (!this.isCurrent(epoch)) return;
-    if (welcome.peerCount >= 2) await this.negotiate();
     this.publishDiagnostics();
     this.startStats();
   }
 
-  private ensurePeerConnection(iceServers: IceServer[]): void {
-    if (this.pc) return;
+  /** Signaling is back for a connection that was kept. Recovery continues only if the media path needs it. */
+  private resumeLink(): void {
+    const pc = this.pc;
+    if (!pc) return;
+    if (iceUp(pc)) {
+      this.hooks.onStatus(this.linkStatus());
+      this.hooks.onPhase?.("live");
+      return;
+    }
+    if (this.recovery?.pc === pc) {
+      if (!this.recovery.exhausted) this.stepRecovery();
+    } else {
+      this.beginRecovery();
+    }
+  }
+
+  private buildConnection(gen: number, iceServers: IceServer[]): void {
+    this.dropConnection();
     const pc = new RTCPeerConnection({ iceServers: sanitizeIceServers(iceServers) });
     this.pc = pc;
-    this.iceBuffer.reset();
+    this.pcGen = gen;
     this.videoPaused = false;
+    // The last picture of the previous connection stays on screen, dimmed by the phase, until the new one delivers.
+    const incoming = new MediaStream();
+    this.remoteStream = incoming;
     for (const track of this.localStream?.getTracks() ?? []) pc.addTrack(track, this.localStream!);
     this.preferCodecs(pc);
     pc.addEventListener("icecandidate", (event) => {
-      if (!event.candidate) return;
+      if (!event.candidate || this.pc !== pc) return;
       this.sendSignal(
         "ice",
         encodeIcePayload({
@@ -450,10 +517,13 @@ export class CallSession {
           sdpMid: event.candidate.sdpMid,
           sdpMLineIndex: event.candidate.sdpMLineIndex,
         }),
+        gen,
       );
     });
     pc.addEventListener("track", (event) => {
-      if (!this.remoteStream.getTracks().includes(event.track)) this.remoteStream.addTrack(event.track);
+      if (this.pc !== pc) return;
+      if (!incoming.getTracks().includes(event.track)) incoming.addTrack(event.track);
+      if (this.remoteVideo.srcObject !== incoming) this.remoteVideo.srcObject = incoming;
       void this.playRemote();
     });
     pc.addEventListener("iceconnectionstatechange", () => {
@@ -462,31 +532,38 @@ export class CallSession {
     });
     pc.addEventListener("connectionstatechange", () => {
       if (this.pc !== pc) return;
-      // Safari reports a broken DTLS session here while ICE still looks connected.
+      // Safari reports a broken DTLS session here while ICE still looks connected. An ICE restart cannot fix that.
       if (pc.connectionState !== "failed") return;
-      if (iceUp(pc) && this.rebuilds < MAX_REBUILDS) {
-        this.rebuilds += 1;
-        this.reconnectSocket();
+      if (iceUp(pc)) {
+        this.stopRecovery();
+        this.recovery = { pc, restarts: ICE_RESTART_TRIES, unacked: 0, awaitingAck: false, rebuildAsked: false, exhausted: false };
+        this.stepRecovery();
       } else {
         this.onIceState("failed");
       }
     });
   }
 
-  private resetPeerConnection(iceServers?: IceServer[]): void {
+  /** Closes the connection and everything that belongs to it: timers, buffered candidates, counters. */
+  private dropConnection(): void {
     const previous = this.pc;
     this.pc = null;
+    this.pcGen = -1;
     previous?.close();
     this.stopRecovery();
     window.clearTimeout(this.disconnectedTimer);
     window.clearTimeout(this.connectTimer);
     this.connectedAt = 0;
+    // Byte and packet counters start from zero on a new connection. A difference against old ones is meaningless.
     this.counters = undefined;
     this.iceRestart = false;
+    this.lastRestartAt = 0;
     this.iceBuffer.reset();
+  }
+
+  private clearRemote(): void {
     this.remoteStream = new MediaStream();
     this.remoteVideo.srcObject = this.remoteStream;
-    if (iceServers) this.ensurePeerConnection(iceServers);
   }
 
   private preferCodecs(pc: RTCPeerConnection): void {
@@ -505,9 +582,14 @@ export class CallSession {
 
   private async negotiate(): Promise<void> {
     const pc = this.pc;
+    const gen = this.pcGen;
     const epoch = this.epoch;
     if (!this.isCurrent(epoch) || !pc || this.peerCount < 2 || this.offeringPc === pc || pc.signalingState !== "stable") return;
-    if (!shouldCreateOffer({ polite: this.polite })) return;
+    if (!shouldCreateOffer({ polite: this.polite })) {
+      // Only the other side offers. If its offer never comes, the watchdog asks for one.
+      this.armConnectWatch(pc);
+      return;
+    }
     this.offeringPc = pc;
     try {
       const offer = await pc.createOffer({ iceRestart: this.iceRestart });
@@ -516,19 +598,19 @@ export class CallSession {
       await pc.setLocalDescription(offer);
       const sdp = pc.localDescription?.sdp;
       if (this.isCurrent(epoch) && this.pc === pc && sdp) {
-        this.sendSignal("offer", sdp);
-        this.armConnectWatch(pc);
+        this.sendSignal("offer", sdp, gen);
+        if (!iceUp(pc)) this.armConnectWatch(pc);
       }
     } catch {
-      if (this.pc === pc) this.armConnectWatch(pc);
+      if (this.pc === pc && !iceUp(pc)) this.armConnectWatch(pc);
     } finally {
       if (this.offeringPc === pc) this.offeringPc = null;
     }
   }
 
-  private async restartIce(): Promise<void> {
-    const pc = this.pc;
-    if (!pc || this.polite || this.offeringPc === pc) return;
+  private async restartIce(pc: RTCPeerConnection): Promise<void> {
+    if (this.pc !== pc || this.polite || this.offeringPc === pc) return;
+    this.lastRestartAt = Date.now();
     if (pc.signalingState === "have-local-offer") {
       // The answer to the last offer never came. Without a rollback no new offer can be made.
       try {
@@ -552,45 +634,71 @@ export class CallSession {
     }, CONNECT_WATCH_MS);
   }
 
+  /** One recovery procedure per connection. A second trigger while it runs changes nothing. */
   private beginRecovery(): void {
-    if (!this.isCurrent(this.epoch) || !this.pc || this.peerCount < 2 || this.recoverTimer) return;
-    this.advanceRecovery();
+    const pc = this.pc;
+    if (!this.isCurrent(this.epoch) || !pc || this.peerCount < 2 || this.recovery?.pc === pc) return;
+    window.clearTimeout(this.recoverTimer);
+    this.recovery = { pc, restarts: 0, unacked: 0, awaitingAck: false, rebuildAsked: false, exhausted: false };
+    this.stepRecovery();
   }
 
-  private advanceRecovery(): void {
+  /**
+   * Signaling first, then ICE restarts on the same connection, then a new connection as the last step.
+   * The offering side restarts by itself. The other side asks it to, and waits for an ack instead of guessing.
+   */
+  private stepRecovery(): void {
+    window.clearTimeout(this.recoverTimer);
     this.recoverTimer = 0;
+    const run = this.recovery;
     const pc = this.pc;
     const epoch = this.epoch;
-    if (!this.isCurrent(epoch) || !pc || this.peerCount < 2 || iceUp(pc)) {
-      this.recoverStep = 0;
+    if (!run || !pc || run.pc !== pc || !this.isCurrent(epoch) || this.peerCount < 2) {
+      this.recovery = null;
       return;
     }
-    // While signaling is down nothing can be exchanged. Its reconnect rebuilds the call on welcome.
+    if (iceUp(pc) && pc.connectionState !== "failed") {
+      this.recovery = null;
+      return;
+    }
+    this.hooks.onPhase?.("trouble");
+    // Nothing can be agreed while a socket is away. The welcome or the peer's return continues from this step.
     if (!this.socketReady) {
-      this.recoverStep = 0;
+      this.hooks.onStatus("Связь с комнатой прервалась. Пробуем снова.");
+      return;
+    }
+    if (!this.peerOnline) {
+      this.hooks.onStatus("У собеседника пропала связь. Ждём его возвращения.");
       return;
     }
     const again = (delay: number): void => {
       this.recoverTimer = window.setTimeout(() => {
-        if (this.isCurrent(epoch)) this.advanceRecovery();
+        if (this.isCurrent(epoch)) this.stepRecovery();
       }, delay);
     };
-    this.recoverStep += 1;
-    this.hooks.onPhase?.("trouble");
-    if (!this.polite && this.recoverStep <= ICE_RESTART_TRIES) {
-      this.hooks.onStatus("Связь пропала. Восстанавливаем.");
-      void this.restartIce();
-      again(RESTART_WAIT_MS);
+    if (run.rebuildAsked) {
+      // The room did not answer the rebuild request, so the socket is suspect. A new one continues from here.
+      run.rebuildAsked = false;
+      this.reconnectSocket();
       return;
     }
-    if (this.polite && this.recoverStep === 1) {
-      // Only the other side may offer. It gets time to restart ICE before this side forces a rebuild.
+    if (run.restarts < ICE_RESTART_TRIES && run.unacked < MAX_UNACKED) {
       this.hooks.onStatus("Связь пропала. Восстанавливаем.");
-      again(POLITE_WAIT_MS);
+      if (this.polite) {
+        run.unacked += 1;
+        run.awaitingAck = true;
+        this.send({ type: "restart", gen: this.pcGen, ack: false });
+        again(ACK_WAIT_MS);
+      } else {
+        run.restarts += 1;
+        // A restart the other side has just asked for already covers this step.
+        if (!this.restartInFlight(pc)) void this.restartIce(pc);
+        again(RESTART_WAIT_MS);
+      }
       return;
     }
-    this.recoverStep = 0;
     if (this.rebuilds >= MAX_REBUILDS) {
+      run.exhausted = true;
       this.hooks.onStatus(
         this.turnMode === "on"
           ? "Не получается восстановить связь. Проверьте интернет и нажмите «Переподключить»."
@@ -599,14 +707,55 @@ export class CallSession {
       return;
     }
     this.rebuilds += 1;
+    run.rebuildAsked = true;
     this.hooks.onStatus("Соединяем заново");
-    this.reconnectSocket();
+    // Both sides may ask at once. They name the same generation, so the room starts exactly one new one.
+    this.send({ type: "rebuild", gen: this.pcGen });
+    again(REBUILD_WAIT_MS);
+  }
+
+  /** The offering side confirmed the request. Now the restart itself gets its time. */
+  private onRestartAck(): void {
+    const run = this.recovery;
+    if (!run || run.pc !== this.pc || !run.awaitingAck) return;
+    run.awaitingAck = false;
+    run.unacked = 0;
+    run.restarts += 1;
+    const epoch = this.epoch;
+    window.clearTimeout(this.recoverTimer);
+    this.recoverTimer = window.setTimeout(() => {
+      if (this.isCurrent(epoch)) this.stepRecovery();
+    }, RESTART_WAIT_MS);
+  }
+
+  /** The other side lost the media path. This side may see nothing wrong and restarts ICE anyway. */
+  private onRestartRequest(): void {
+    const pc = this.pc;
+    if (!pc || this.polite) return;
+    this.send({ type: "restart", gen: this.pcGen, ack: true });
+    if (this.restartInFlight(pc)) return;
+    void this.restartIce(pc);
+  }
+
+  /** True while an ICE restart is being negotiated or has only just been answered. */
+  private restartInFlight(pc: RTCPeerConnection): boolean {
+    if (this.offeringPc === pc || pc.signalingState === "have-local-offer") return this.lastRestartAt > 0;
+    return this.lastRestartAt > 0 && Date.now() - this.lastRestartAt < RESTART_SETTLE_MS;
+  }
+
+  private pauseRecovery(): void {
+    window.clearTimeout(this.recoverTimer);
+    this.recoverTimer = 0;
+    if (this.recovery) {
+      this.recovery.awaitingAck = false;
+      this.recovery.rebuildAsked = false;
+    }
   }
 
   private stopRecovery(): void {
     window.clearTimeout(this.recoverTimer);
     this.recoverTimer = 0;
-    this.recoverStep = 0;
+    this.recovery = null;
   }
 
   private async applySignal(kind: "offer" | "answer" | "ice", payload: string): Promise<void> {
@@ -616,6 +765,7 @@ export class CallSession {
 
   private async onRemoteDescription(kind: "offer" | "answer", sdp: string): Promise<void> {
     const pc = this.pc;
+    const gen = this.pcGen;
     if (!pc || !sdp.startsWith("v=")) return;
     // An answer to an offer that was rolled back or belongs to a replaced connection.
     if (kind === "answer" && pc.signalingState !== "have-local-offer") return;
@@ -630,7 +780,7 @@ export class CallSession {
       try {
         await pc.setLocalDescription({ type: "rollback" });
       } catch {
-        if (this.pc === pc) this.resetPeerConnection(this.savedIce);
+        return;
       }
     }
     const current = this.pc;
@@ -644,7 +794,7 @@ export class CallSession {
         if (this.pc !== current) return;
         await current.setLocalDescription(answer);
         if (this.pc === current && current.localDescription?.sdp) {
-          this.sendSignal("answer", current.localDescription.sdp);
+          this.sendSignal("answer", current.localDescription.sdp, gen);
           if (!iceUp(current)) this.armConnectWatch(current);
         }
       }
@@ -677,6 +827,8 @@ export class CallSession {
       window.clearTimeout(this.connectTimer);
       this.stopRecovery();
       this.rebuilds = 0;
+      // That restart is finished. A request that comes now is about a new failure.
+      this.lastRestartAt = 0;
       this.hooks.onWaiting(false);
       this.hooks.onStatus(this.linkStatus());
       this.hooks.onPhase?.("live");
@@ -687,15 +839,17 @@ export class CallSession {
       }
       return;
     }
+    // A running recovery owns the status line: it may be waiting for the room or for the other person.
+    const announce = this.recovery?.pc !== this.pc;
     if (state === "failed") {
       this.hooks.onPhase?.("trouble");
-      this.hooks.onStatus("Связь пропала. Восстанавливаем.");
+      if (announce) this.hooks.onStatus("Связь пропала. Восстанавливаем.");
       this.beginRecovery();
       return;
     }
     if (state === "disconnected") {
       this.hooks.onPhase?.("trouble");
-      this.hooks.onStatus("Связь пропала. Восстанавливаем.");
+      if (announce) this.hooks.onStatus("Связь пропала. Восстанавливаем.");
       // Right after a network change there is nothing to wait for.
       const wait = Date.now() - this.networkChangedAt < 10_000 ? 500 : 3_000;
       this.disconnectedTimer = window.setTimeout(() => {
@@ -720,10 +874,14 @@ export class CallSession {
     if (pc && this.peerCount >= 2 && (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed")) this.beginRecovery();
   }
 
-  private sendSignal(kind: "offer" | "answer" | "ice", payload: string): void {
+  private sendSignal(kind: "offer" | "answer" | "ice", payload: string, gen: number): void {
+    this.send({ type: "signal", kind, payload, gen });
+  }
+
+  private send(message: object): void {
     // Before the welcome the server treats any message except hello as a protocol error and ends the call.
     if (!this.socketReady || this.socket?.readyState !== WebSocket.OPEN) return;
-    this.socket.send(JSON.stringify({ type: "signal", kind, payload }));
+    this.socket.send(JSON.stringify(message));
   }
 
   private startStats(): void {
@@ -962,8 +1120,7 @@ export class CallSession {
     this.socket = null;
     this.socketReady = false;
     this.stopMedia();
-    this.remoteStream = new MediaStream();
-    this.remoteVideo.srcObject = this.remoteStream;
+    this.clearRemote();
     this.hooks.onEnded(text);
     this.hooks.onPhase?.("ended");
   }
@@ -973,8 +1130,7 @@ export class CallSession {
   }
 
   private stopMedia(): void {
-    this.pc?.close();
-    this.pc = null;
+    this.dropConnection();
     this.localStream?.getTracks().forEach((track) => track.stop());
     this.localStream = null;
     this.localVideo.srcObject = null;
@@ -1073,4 +1229,8 @@ function closeText(code: number, reason: string): string {
   if (reason === "rate") return "Слишком много попыток подряд. Подождите немного.";
   if (code === 1000) return "Звонок завершён";
   return "Соединение закрыто";
+}
+
+function generationOf(value: unknown): number | null {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
 }
