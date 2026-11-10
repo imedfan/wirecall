@@ -73,7 +73,26 @@ describe("room isolation and two-peer bound", () => {
     expect(resumed.state.peers.find((peer) => peer.peerId === "a")?.resumeHash).toBe("hash-a2");
   });
 
-  it("drops a stale peer that is gone and delivers a queued offer to the next joiner", () => {
+  it("gives a newcomer the role the remaining peer does not hold", () => {
+    const first = admit(newRoom(0, ttl), "a", "hash-a");
+    if (!first.ok) throw new Error("admit");
+    const second = admit(first.state, "b", "hash-b");
+    if (!second.ok) throw new Error("admit");
+    // The impolite first peer hangs up and comes back on a new seat. The polite one stayed.
+    const left = leavePeer(second.state, "a");
+    const back = admit(left.state, "c", "hash-c", 2_000, ["b"]);
+    if (!back.ok) throw new Error("admit");
+    expect(back.polite).toBe(false);
+    expect(back.state.peers.map((peer) => peer.polite).sort()).toEqual([false, true]);
+    expect(back.notify).toBe("joined");
+    // The polite one leaves instead: the newcomer must be polite again.
+    const other = leavePeer(second.state, "b");
+    const again = admit(other.state, "d", "hash-d", 2_000, ["a"]);
+    if (!again.ok) throw new Error("admit");
+    expect(again.polite).toBe(true);
+  });
+
+  it("drops a stale peer that is gone and does not replay old signals to the next joiner", () => {
     const longTtl = 600_000;
     const first = admitPeer(newRoom(0, longTtl), {
       now: 1_000,
@@ -103,7 +122,8 @@ describe("room isolation and two-peer bound", () => {
       livePeerIds: ["a"],
     });
     if (!joined.ok) throw new Error("join");
-    expect(joined.flush.map((signal) => signal.payload)).toEqual(["v=0\r\noffer"]);
+    expect(joined.flush).toEqual([]);
+    expect(joined.state.queued).toEqual([]);
     const touched = touchPeer(joined.state, "b", 200_000, longTtl, ["b"]);
     expect(touched.removedPeerIds).toEqual(["a"]);
     expect(touched.state.peers.map((peer) => peer.peerId)).toEqual(["b"]);

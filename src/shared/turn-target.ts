@@ -1,4 +1,5 @@
-export const TURN_CREDENTIAL_TTL_SECONDS = 3600;
+// Long calls and late ICE restarts reuse these credentials, so they must outlive the call.
+export const TURN_CREDENTIAL_TTL_SECONDS = 86_400;
 
 const KEY_ID_RE = /^[A-Za-z0-9]{8,128}$/;
 

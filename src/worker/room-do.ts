@@ -34,7 +34,8 @@ interface TurnCache {
 
 const MAX_SOCKETS = 4;
 const MESSAGE_WINDOW_MS = 10_000;
-const MESSAGE_LIMIT = 50;
+// A Mac with several interfaces plus TURN trickles dozens of candidates per ICE restart.
+const MESSAGE_LIMIT = 100;
 const INDEX_TOUCH_MS = 60 * 60 * 1000;
 
 export class RoomDurableObject extends DurableObject<Env> {
@@ -184,9 +185,10 @@ export class RoomDurableObject extends DurableObject<Env> {
       resumeToken,
     });
     if (admitted.notify === "joined") {
-      this.sendToPeers({ type: "peer-joined", peerCount: admitted.peerCount }, admitted.peerId);
+      // The waiting peer may hold hour-old TURN credentials. It rebuilds with these.
+      this.sendToPeers({ type: "peer-joined", peerCount: admitted.peerCount, turnMode: ice.mode, iceServers: ice.iceServers }, admitted.peerId);
     } else if (admitted.notify === "reset") {
-      this.sendToPeers({ type: "peer-reset", peerCount: admitted.peerCount }, admitted.peerId);
+      this.sendToPeers({ type: "peer-reset", peerCount: admitted.peerCount, turnMode: ice.mode, iceServers: ice.iceServers }, admitted.peerId);
     }
     if (!admitted.resumed) {
       for (const signal of admitted.flush) this.send(ws, signalMessage(signal));
