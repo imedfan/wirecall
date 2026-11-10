@@ -1,6 +1,8 @@
 import { isResumeToken } from "./ids";
 
-export const PROTOCOL_VERSION = 1;
+// Version 2 adds the connection generation. A page from before it cannot mix its signals into a newer call.
+export const PROTOCOL_VERSION = 2;
+export const MAX_GENERATION = 1_000_000_000;
 export const MAX_CLIENT_MESSAGE_CHARS = 40_000;
 export const MAX_SDP_CHARS = 32_000;
 export const MAX_ICE_CANDIDATE_CHARS = 2_000;
@@ -14,8 +16,10 @@ export interface IcePayload {
 }
 
 export type ClientMessage =
-  | { type: "hello"; protocol: number; resume?: string }
-  | { type: "signal"; kind: SignalKind; payload: string }
+  | { type: "hello"; protocol: number; resume?: string; gen?: number }
+  | { type: "signal"; kind: SignalKind; payload: string; gen: number }
+  | { type: "restart"; gen: number; ack: boolean }
+  | { type: "rebuild"; gen: number }
   | { type: "hangup" }
   | { type: "ping" };
 
@@ -38,6 +42,10 @@ export function parseClientMessage(raw: string): { ok: true; message: ClientMess
       if (typeof record.resume !== "string" || !isResumeToken(record.resume)) return { ok: false, code: "bad-message" };
       message.resume = record.resume;
     }
+    if (record.gen !== undefined) {
+      if (!isGeneration(record.gen)) return { ok: false, code: "bad-message" };
+      message.gen = record.gen;
+    }
     return { ok: true, message };
   }
   if (record.type === "hangup") return { ok: true, message: { type: "hangup" } };
@@ -48,9 +56,22 @@ export function parseClientMessage(raw: string): { ok: true; message: ClientMess
     }
     if (typeof record.payload !== "string") return { ok: false, code: "bad-message" };
     if (!validSignalPayload(record.kind, record.payload)) return { ok: false, code: "bad-message" };
-    return { ok: true, message: { type: "signal", kind: record.kind, payload: record.payload } };
+    if (!isGeneration(record.gen)) return { ok: false, code: "bad-message" };
+    return { ok: true, message: { type: "signal", kind: record.kind, payload: record.payload, gen: record.gen } };
+  }
+  if (record.type === "restart") {
+    if (!isGeneration(record.gen) || typeof record.ack !== "boolean") return { ok: false, code: "bad-message" };
+    return { ok: true, message: { type: "restart", gen: record.gen, ack: record.ack } };
+  }
+  if (record.type === "rebuild") {
+    if (!isGeneration(record.gen)) return { ok: false, code: "bad-message" };
+    return { ok: true, message: { type: "rebuild", gen: record.gen } };
   }
   return { ok: false, code: "bad-message" };
+}
+
+export function isGeneration(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 && value <= MAX_GENERATION;
 }
 
 export function validSignalPayload(kind: SignalKind, payload: string): boolean {
