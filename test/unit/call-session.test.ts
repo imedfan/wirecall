@@ -183,7 +183,7 @@ describe("call session mute and hangup", () => {
     await flush();
     expect(switched.getAudioTracks()[0]?.enabled).toBe(false);
     expect(switched.getVideoTracks()[0]?.enabled).toBe(false);
-    expect(statuses.at(-1)).toBe("Устройства восстановлены в том состоянии, в котором вы их оставили.");
+    expect(statuses.at(-1)).toBe("Камера и микрофон снова работают");
     call.hangup();
     expect(listeners.get("visibilitychange")?.size ?? 0).toBe(0);
   });

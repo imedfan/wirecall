@@ -6,6 +6,11 @@ export default tseslint.config(
   js.configs.recommended,
   ...tseslint.configs.recommended,
   {
+    // Local Node scripts, not part of the app.
+    files: ["scripts/**"],
+    languageOptions: { globals: { process: "readonly", console: "readonly" } },
+  },
+  {
     rules: {
       "@typescript-eslint/no-unused-vars": ["error", { "argsIgnorePattern": "^_" }],
     },
