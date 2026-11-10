@@ -14,6 +14,47 @@ async function launch(): Promise<Browser> {
   });
 }
 
+/** Creates a room on the home page and returns its path. The full address lives only in the link itself. */
+async function createRoom(page: Page): Promise<string> {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Создать ссылку" }).click();
+  const path = await page.getByRole("link", { name: "Открыть звонок" }).getAttribute("href");
+  expect(path).toMatch(/^\/r\//u);
+  return path!;
+}
+
+test("the home page has one main button and a drifting background that stands still on request", async ({ browser }) => {
+  const page = await browser.newPage();
+  await page.goto("/");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Звонок для двоих");
+  await expect(page.locator(".home .btn-primary")).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Подробнее" })).toBeVisible();
+  // The technical notes are not on the page itself.
+  expect(await page.locator(".home").innerText()).not.toMatch(/TURN|STUN|Cloudflare/u);
+  const spots = page.locator(".aurora i");
+  await expect(spots).toHaveCount(4);
+  const moving = await spots.evaluateAll((nodes) => nodes.map((node) => getComputedStyle(node).animationName));
+  expect(moving.every((name) => name.startsWith("drift"))).toBe(true);
+  // Only transform is animated, so the work stays on the compositor.
+  const animated = await page.evaluate(() => document.getAnimations().flatMap((animation) => {
+    const effect = animation.effect as KeyframeEffect;
+    return effect.getKeyframes().flatMap((frame) => Object.keys(frame).filter((key) => !["offset", "easing", "composite", "computedOffset"].includes(key)));
+  }));
+  expect([...new Set(animated)]).toEqual(["transform"]);
+  // A hidden tab stops the drift.
+  await page.evaluate(() => document.documentElement.classList.add("page-hidden"));
+  expect(await spots.first().evaluate((node) => getComputedStyle(node).animationPlayState)).toBe("paused");
+  await page.close();
+
+  const still = await browser.newPage({ reducedMotion: "reduce" });
+  await still.goto("/");
+  await expect(still.locator(".aurora i")).toHaveCount(4);
+  const names = await still.locator(".aurora i").evaluateAll((nodes) => nodes.map((node) => getComputedStyle(node).animationName));
+  expect(names).toEqual(["none", "none", "none", "none"]);
+  expect(await still.evaluate(() => document.getAnimations().length)).toBe(0);
+  await still.close();
+});
+
 test("two peers connect with fake media and a third is refused", async () => {
   await mkdir(artifacts, { recursive: true });
   const browser = await launch();
@@ -41,12 +82,11 @@ test("two peers connect with fake media and a third is refused", async () => {
     Object.setPrototypeOf(Wrapped, Original);
     window.RTCPeerConnection = Wrapped;
   });
-  await left.goto("/");
+  const path = await createRoom(left);
+  // The page shows a short form of the link. The whole room key is not printed on it.
+  await expect(left.locator(".link-short")).toContainText("/r/");
+  expect(await left.locator(".link-card").innerText()).not.toContain(path);
   await left.screenshot({ path: `${artifacts}/wirecall-home.png` });
-  await left.getByRole("button", { name: "Создать ссылку" }).click();
-  await expect(left.locator(".link-box")).toContainText("/r/");
-  const href = await left.locator(".link-box").innerText();
-  const path = new URL(href).pathname;
   await left.goto(path);
   await right.goto(path);
   await left.screenshot({ path: `${artifacts}/wirecall-lobby.png` });
@@ -252,10 +292,7 @@ test("hanging up and joining again reconnects from either role, and so does a re
   const browser = await launch();
   const left = await browser.newPage();
   const right = await browser.newPage();
-  await left.goto("/");
-  await left.getByRole("button", { name: "Создать ссылку" }).click();
-  const href = await left.locator(".link-box").innerText();
-  const path = new URL(href).pathname;
+  const path = await createRoom(left);
   await left.goto(path);
   await right.goto(path);
   await left.getByRole("button", { name: "Войти в звонок" }).click();
@@ -378,10 +415,7 @@ async function openCall(browser: Browser): Promise<{ left: Page; right: Page; pa
   const right = await browser.newPage();
   await arm(left);
   await arm(right);
-  await left.goto("/");
-  await left.getByRole("button", { name: "Создать ссылку" }).click();
-  await expect(left.locator(".link-box")).toContainText("/r/");
-  const path = new URL(await left.locator(".link-box").innerText()).pathname;
+  const path = await createRoom(left);
   await left.goto(path);
   await right.goto(path);
   await left.getByRole("button", { name: "Войти в звонок" }).click();
@@ -487,10 +521,7 @@ async function framesAdvance(page: Page): Promise<void> {
 test("permission failure shows recovery guidance", async () => {
   const browser = await chromium.launch({ args: ["--deny-permission-prompts"] });
   const page = await browser.newPage();
-  await page.goto("/");
-  await page.getByRole("button", { name: "Создать ссылку" }).click();
-  const href = await page.locator(".link-box").innerText();
-  await page.goto(new URL(href).pathname);
+  await page.goto(await createRoom(page));
   await page.getByRole("button", { name: "Войти в звонок" }).click();
   // Headless Chromium reports no devices on Linux and "not supported" on macOS. Both must end in visible guidance.
   await expect(page.locator(".media-issue")).toContainText(/камер/u);
