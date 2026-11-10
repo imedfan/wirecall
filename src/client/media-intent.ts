@@ -26,8 +26,14 @@ export function applyMediaIntent(track: { kind: string; enabled: boolean }, inte
 export interface VideoTrackControl {
   kind: string;
   enabled: boolean;
-  applyConstraints(constraints: { width?: number; height?: number; frameRate?: number }): Promise<void>;
+  applyConstraints(constraints: CaptureLimits): Promise<void>;
   getSettings(): { width?: number; height?: number };
+}
+
+export interface CaptureLimits {
+  width?: number;
+  height?: number;
+  frameRate?: number;
 }
 
 export interface VideoEncoding {
@@ -64,16 +70,25 @@ export interface VideoTierResult {
 /** Speech stays clear at this rate, and it leaves the rest of a thin link to the picture. */
 export const AUDIO_MAX_BITRATE = 40_000;
 
+/** The size each camera track delivered before anything was asked of it. The way back up from the lowest tier. */
+const nativeSizes = new WeakMap<object, { width?: number; height?: number }>();
+
 /**
- * Puts a tier's limits on outgoing video: bitrate, frame rate and frame size. It only ever makes the
- * video cheaper. It never deactivates the encoding, detaches the track or disables it: the picture
- * stays on every tier, and only the person's own camera button turns it off.
+ * Puts a tier's limits on outgoing video: bitrate first, then frame rate, and frame size only on the
+ * lowest tier. It only ever makes the video cheaper. It never deactivates the encoding, detaches the
+ * track or disables it: the picture stays on every tier, and only the person's own camera button turns it off.
+ *
+ * A call that does not throw is not proof the browser obeyed. The diagnostics sheet shows the frame rate
+ * and size the encoder really produces, from getStats, and that is where each device has to be checked.
  */
 export async function applyVideoTier(sender: VideoSenderControl, tier: QualityTier, intent: MediaIntent): Promise<VideoTierResult> {
   const track = sender.track;
   if (track) applyMediaIntent(track, intent);
   const profile = TIER_PROFILES[tier];
   const settings = track?.getSettings() ?? {};
+  if (track && !nativeSizes.has(track) && settings.width && settings.height) {
+    nativeSizes.set(track, { width: settings.width, height: settings.height });
+  }
   const shortSide = shorter(settings.width, settings.height);
   try {
     // setParameters only accepts the object getParameters returned (transactionId, codecs), with fields changed in place.
@@ -86,7 +101,8 @@ export async function applyVideoTier(sender: VideoSenderControl, tier: QualityTi
       scaleResolutionDownBy: scaleForHeight(shortSide, tier),
     };
     try {
-      params.degradationPreference = "balanced";
+      // Asks the encoder to give up frames before sharpness when the link gets tight.
+      params.degradationPreference = "maintain-resolution";
       await sender.setParameters(params);
     } catch {
       // Some browsers reject the preference. The limits matter more, so they are sent again without it.
@@ -101,7 +117,10 @@ export async function applyVideoTier(sender: VideoSenderControl, tier: QualityTi
   }
   if (!track) return { applied: false, via: "none" };
   try {
-    await track.applyConstraints(captureSize(settings, profile.targetHeight, profile.maxFramerate));
+    // The frame size is named too, at its current value on every tier but the lowest, so that a change of
+    // frame rate alone does not let the camera pick another size or restart.
+    const native = nativeSizes.get(track) ?? settings;
+    await track.applyConstraints({ ...frameSize(native, profile.targetHeight), frameRate: profile.maxFramerate });
     applyMediaIntent(track, intent);
     return { applied: true, via: "constraints" };
   } catch {
@@ -111,18 +130,15 @@ export async function applyVideoTier(sender: VideoSenderControl, tier: QualityTi
 }
 
 /**
- * Keeps the proportions the camera really delivers. An iPhone held upright is 720 by 1280,
- * and forcing 16:9 on it would crop or fail.
+ * The capture size for a tier, without the frame rate: the two are separate knobs. Keeps the proportions
+ * the camera really delivers (an iPhone held upright is 720 by 1280, and forcing 16:9 on it would crop
+ * or fail) and never asks for a larger frame than the camera gives. A size that is not known is left alone.
  */
-export function captureSize(
-  settings: { width?: number; height?: number },
-  targetShortSide: number,
-  frameRate: number,
-): { width?: number; height?: number; frameRate: number } {
-  const { width, height } = settings;
-  if (!width || !height) return { height: targetShortSide, frameRate };
+export function frameSize(native: { width?: number; height?: number }, targetShortSide: number): { width?: number; height?: number } {
+  const { width, height } = native;
+  if (!width || !height) return {};
   const scale = Math.min(1, targetShortSide / Math.min(width, height));
-  return { width: Math.round(width * scale), height: Math.round(height * scale), frameRate };
+  return { width: Math.round(width * scale), height: Math.round(height * scale) };
 }
 
 /**

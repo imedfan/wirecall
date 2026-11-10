@@ -10,7 +10,9 @@ export default defineConfig({
     ...devices["Desktop Chrome"],
   },
   webServer: {
-    command: "npx wrangler dev --port 8787 --ip 127.0.0.1",
+    // Each run gets its own empty room storage. Rooms left by earlier runs would otherwise count
+    // against the hourly creation limit, and the tests would start failing after a few runs in a row.
+    command: "rm -rf .wrangler/test-state && npx wrangler dev --port 8787 --ip 127.0.0.1 --persist-to .wrangler/test-state",
     url: "http://127.0.0.1:8787/api/health",
     reuseExistingServer: false,
     timeout: 60_000,

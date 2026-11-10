@@ -14,6 +14,47 @@ async function launch(): Promise<Browser> {
   });
 }
 
+/** Creates a room on the home page and returns its path. The full address lives only in the link itself. */
+async function createRoom(page: Page): Promise<string> {
+  await page.goto("/");
+  await page.getByRole("button", { name: "Создать ссылку" }).click();
+  const path = await page.getByRole("link", { name: "Открыть звонок" }).getAttribute("href");
+  expect(path).toMatch(/^\/r\//u);
+  return path!;
+}
+
+test("the home page has one main button and a drifting background that stands still on request", async ({ browser }) => {
+  const page = await browser.newPage();
+  await page.goto("/");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Звонок для двоих");
+  await expect(page.locator(".home .btn-primary")).toHaveCount(1);
+  await expect(page.getByRole("button", { name: "Подробнее" })).toBeVisible();
+  // The technical notes are not on the page itself.
+  expect(await page.locator(".home").innerText()).not.toMatch(/TURN|STUN|Cloudflare/u);
+  const spots = page.locator(".aurora i");
+  await expect(spots).toHaveCount(4);
+  const moving = await spots.evaluateAll((nodes) => nodes.map((node) => getComputedStyle(node).animationName));
+  expect(moving.every((name) => name.startsWith("drift"))).toBe(true);
+  // Only transform is animated, so the work stays on the compositor.
+  const animated = await page.evaluate(() => document.getAnimations().flatMap((animation) => {
+    const effect = animation.effect as KeyframeEffect;
+    return effect.getKeyframes().flatMap((frame) => Object.keys(frame).filter((key) => !["offset", "easing", "composite", "computedOffset"].includes(key)));
+  }));
+  expect([...new Set(animated)]).toEqual(["transform"]);
+  // A hidden tab stops the drift.
+  await page.evaluate(() => document.documentElement.classList.add("page-hidden"));
+  expect(await spots.first().evaluate((node) => getComputedStyle(node).animationPlayState)).toBe("paused");
+  await page.close();
+
+  const still = await browser.newPage({ reducedMotion: "reduce" });
+  await still.goto("/");
+  await expect(still.locator(".aurora i")).toHaveCount(4);
+  const names = await still.locator(".aurora i").evaluateAll((nodes) => nodes.map((node) => getComputedStyle(node).animationName));
+  expect(names).toEqual(["none", "none", "none", "none"]);
+  expect(await still.evaluate(() => document.getAnimations().length)).toBe(0);
+  await still.close();
+});
+
 test("two peers connect with fake media and a third is refused", async () => {
   await mkdir(artifacts, { recursive: true });
   const browser = await launch();
@@ -41,19 +82,21 @@ test("two peers connect with fake media and a third is refused", async () => {
     Object.setPrototypeOf(Wrapped, Original);
     window.RTCPeerConnection = Wrapped;
   });
-  await left.goto("/");
+  const path = await createRoom(left);
+  // The page shows a short form of the link. The whole room key is not printed on it.
+  await expect(left.locator(".link-short")).toContainText("/r/");
+  expect(await left.locator(".link-card").innerText()).not.toContain(path);
   await left.screenshot({ path: `${artifacts}/wirecall-home.png` });
-  await left.getByRole("button", { name: "Создать ссылку" }).click();
-  await expect(left.locator(".link-box")).toContainText("/r/");
-  const href = await left.locator(".link-box").innerText();
-  const path = new URL(href).pathname;
   await left.goto(path);
   await right.goto(path);
   await left.screenshot({ path: `${artifacts}/wirecall-lobby.png` });
+  // The lobby is one button. The notes about relays and Safari are not on it.
+  await expect(left.locator(".call .btn-primary:visible")).toHaveCount(1);
+  expect(await left.locator(".call").innerText()).not.toMatch(/TURN|Релей|STUN|Safari/u);
   await left.getByRole("button", { name: "Войти в звонок" }).click();
   await right.getByRole("button", { name: "Войти в звонок" }).click();
-  await expect(left.locator(".status")).toHaveText("На связи", { timeout: 20_000 });
-  await expect(right.locator(".status")).toHaveText("На связи", { timeout: 20_000 });
+  await expectLive(left, 20_000);
+  await expectLive(right, 20_000);
   await expect.poll(async () => left.locator("video.remote").evaluate((node) => (node as HTMLVideoElement).videoWidth)).toBeGreaterThan(0);
   // The quality badge is on screen during the call: words and bars, announced politely to a screen reader.
   for (const page of [left, right]) {
@@ -61,10 +104,14 @@ test("two peers connect with fake media and a third is refused", async () => {
     await expect(badge).toBeVisible();
     await expect(badge).toHaveAttribute("aria-live", "polite");
     await expect(badge.locator(".quality-text")).toHaveText("Связь хорошая");
+    // A working call announces nothing else: the old «На связи» pill is gone.
+    await expect(page.locator(".status")).toHaveText("");
     await expect(badge).toHaveAttribute("data-bars", "4");
     await expect(badge.locator(".quality-bars i")).toHaveCount(4);
     // The other person's tier arrives over the data channel, not from a guess.
-    await expect(badge.locator(".quality-peer")).toHaveText("У собеседника связь хорошая", { timeout: 20_000 });
+    await expect(badge).toHaveAttribute("data-peer", "good", { timeout: 20_000 });
+    // A good link on the other side is not worth a line of text.
+    await expect(badge.locator(".quality-peer")).toBeHidden();
   }
   // Voice is capped and prioritised, video is limited but on.
   const senders = await left.evaluate(async () => {
@@ -79,10 +126,10 @@ test("two peers connect with fake media and a third is refused", async () => {
       videoHint: pick("video")?.track?.contentHint,
     };
   });
-  expect(senders).toEqual({ audioMax: 40_000, videoActive: true, videoMax: 1_200_000, audioHint: "speech", videoHint: "motion" });
-  await left.getByRole("button", { name: "Микрофон", exact: true }).click();
+  expect(senders).toEqual({ audioMax: 40_000, videoActive: true, videoMax: 1_200_000, audioHint: "speech", videoHint: "detail" });
+  await press(left, "Микрофон");
   await expect(left.getByRole("button", { name: "Микрофон выключен", exact: true })).toHaveAttribute("aria-pressed", "true");
-  await left.getByRole("button", { name: "Камера", exact: true }).click();
+  await press(left, "Камера");
   await expect(left.getByRole("button", { name: "Камера выключена", exact: true })).toHaveAttribute("aria-pressed", "true");
   await left.screenshot({ path: `${artifacts}/wirecall-call.png` });
   const third = await browser.newPage();
@@ -99,7 +146,7 @@ test("two peers connect with fake media and a third is refused", async () => {
 test("a signaling drop alone keeps the same connection, tracks and picture", async () => {
   const browser = await launch();
   const { left, right, path } = await openCall(browser);
-  await left.getByRole("button", { name: "Микрофон", exact: true }).click();
+  await press(left, "Микрофон");
   for (const dropped of [right, left, right]) {
     const before = { left: await snapshot(left), right: await snapshot(right) };
     await markStatuses(left);
@@ -138,7 +185,7 @@ test("a media failure seen by one side is repaired by an ICE restart, whichever 
     const started = Date.now();
     await forceIce(broken, "failed");
     await expect.poll(async () => (await snapshot(left)).offers, { timeout: 5_000 }).toBe(before.left.offers + 1);
-    await expect(broken.locator(".status")).toHaveText("На связи", { timeout: 10_000 });
+    await expectLive(broken, 10_000);
     // Far below the 40 seconds the non-offering side used to wait passively.
     expect(Date.now() - started).toBeLessThan(10_000);
     const after = { left: await snapshot(left), right: await snapshot(right) };
@@ -162,8 +209,8 @@ test("both sides noticing the failure at once produce one offer and no rebuild",
   const { left, right } = await openCall(browser);
   const before = { left: await snapshot(left), right: await snapshot(right) };
   await Promise.all([forceIce(left, "failed"), forceIce(right, "failed")]);
-  await expect(left.locator(".status")).toHaveText("На связи", { timeout: 10_000 });
-  await expect(right.locator(".status")).toHaveText("На связи", { timeout: 10_000 });
+  await expectLive(left, 10_000);
+  await expectLive(right, 10_000);
   // Long enough for a second, conflicting procedure to show itself.
   await left.waitForTimeout(4_000);
   const after = { left: await snapshot(left), right: await snapshot(right) };
@@ -172,8 +219,8 @@ test("both sides noticing the failure at once produce one offer and no rebuild",
   expect(after.left.pcs).toBe(before.left.pcs);
   expect(after.right.pcs).toBe(before.right.pcs);
   expect(after.left.rebuilds + after.right.rebuilds).toBe(before.left.rebuilds + before.right.rebuilds);
-  await expect(left.locator(".status")).toHaveText("На связи");
-  await expect(right.locator(".status")).toHaveText("На связи");
+  await expectLive(left);
+  await expectLive(right);
   await framesAdvance(left);
   await framesAdvance(right);
   await browser.close();
@@ -182,8 +229,8 @@ test("both sides noticing the failure at once produce one offer and no rebuild",
 test("a rebuild happens once, keeps mute, camera and quality limits, and ignores the old connection's signals", async () => {
   const browser = await launch();
   const { left, right } = await openCall(browser);
-  await left.getByRole("button", { name: "Микрофон", exact: true }).click();
-  await right.getByRole("button", { name: "Камера", exact: true }).click();
+  await press(left, "Микрофон");
+  await press(right, "Камера");
   const before = { left: await snapshot(left), right: await snapshot(right) };
   const oldGen = before.left.gen;
   const oldOffer = await left.evaluate(() => (window as unknown as Probe).__wc.lastOffer);
@@ -191,8 +238,8 @@ test("a rebuild happens once, keeps mute, camera and quality limits, and ignores
   await Promise.all([sendRaw(left, { type: "rebuild", gen: oldGen }), sendRaw(right, { type: "rebuild", gen: oldGen })]);
   await expect.poll(async () => (await snapshot(left)).pcs).toBe(before.left.pcs + 1);
   await expect.poll(async () => (await snapshot(right)).pcs).toBe(before.right.pcs + 1);
-  await expect(left.locator(".status")).toHaveText("На связи", { timeout: 25_000 });
-  await expect(right.locator(".status")).toHaveText("На связи", { timeout: 25_000 });
+  await expectLive(left, 25_000);
+  await expectLive(right, 25_000);
   await framesAdvance(left);
   const rebuilt = { left: await snapshot(left), right: await snapshot(right) };
   expect(rebuilt.left.rebuilds).toBe(before.left.rebuilds + 1);
@@ -221,7 +268,7 @@ test("a rebuild happens once, keeps mute, camera and quality limits, and ignores
   expect(late.answers).toBe(rebuilt.right.answers);
   expect(late.signaling).toBe("stable");
   expect(late.pcs).toBe(rebuilt.right.pcs);
-  await expect(right.locator(".status")).toHaveText("На связи");
+  await expectLive(right);
   await framesAdvance(right);
   await browser.close();
 });
@@ -231,7 +278,7 @@ test("hanging up in the middle of a recovery ends the call for good", async () =
   const { left, right } = await openCall(browser);
   await forceIce(left, "failed");
   await forceIce(right, "failed");
-  await left.getByRole("button", { name: "Завершить" }).click();
+  await press(left, "Завершить");
   await expect(left.locator(".status")).toHaveText("Звонок завершён");
   const ended = await snapshot(left);
   // Longer than every recovery timer: ack wait, restart wait, connect watchdog.
@@ -252,18 +299,15 @@ test("hanging up and joining again reconnects from either role, and so does a re
   const browser = await launch();
   const left = await browser.newPage();
   const right = await browser.newPage();
-  await left.goto("/");
-  await left.getByRole("button", { name: "Создать ссылку" }).click();
-  const href = await left.locator(".link-box").innerText();
-  const path = new URL(href).pathname;
+  const path = await createRoom(left);
   await left.goto(path);
   await right.goto(path);
   await left.getByRole("button", { name: "Войти в звонок" }).click();
   await expect(left.locator(".status")).toContainText("Ждём");
   await right.getByRole("button", { name: "Войти в звонок" }).click();
   const live = async () => {
-    await expect(left.locator(".status")).toHaveText("На связи", { timeout: 25_000 });
-    await expect(right.locator(".status")).toHaveText("На связи", { timeout: 25_000 });
+    await expectLive(left, 25_000);
+    await expectLive(right, 25_000);
     for (const page of [left, right]) {
       await expect.poll(async () => page.locator("video.remote").evaluate((node) => (node as HTMLVideoElement).videoWidth)).toBeGreaterThan(0);
     }
@@ -271,7 +315,7 @@ test("hanging up and joining again reconnects from either role, and so does a re
   await live();
   // The first to join is the only one allowed to offer. When that person leaves and returns, someone must still offer.
   for (const [page, other] of [[left, right], [right, left]] as const) {
-    await page.getByRole("button", { name: "Завершить" }).click();
+    await press(page, "Завершить");
     await expect(page.locator(".status")).toHaveText("Звонок завершён");
     await expect(other.locator(".status")).toContainText("вышел");
     await page.getByRole("button", { name: "Войти снова" }).click();
@@ -283,6 +327,16 @@ test("hanging up and joining again reconnects from either role, and so does a re
   await live();
   await browser.close();
 });
+
+async function expectLive(page: Page, timeout = 20_000): Promise<void> {
+  await expect(page.locator(".call")).toHaveAttribute("data-phase", "live", { timeout });
+}
+
+/** The controls hide by themselves during a live call. Any key brings them back, then the button can be clicked. */
+async function press(page: Page, name: string): Promise<void> {
+  await page.keyboard.press("Shift");
+  await page.getByRole("button", { name, exact: true }).click();
+}
 
 interface ProbeState {
   pcs: (RTCPeerConnection & { __force: (state: string | null) => void })[];
@@ -378,17 +432,14 @@ async function openCall(browser: Browser): Promise<{ left: Page; right: Page; pa
   const right = await browser.newPage();
   await arm(left);
   await arm(right);
-  await left.goto("/");
-  await left.getByRole("button", { name: "Создать ссылку" }).click();
-  await expect(left.locator(".link-box")).toContainText("/r/");
-  const path = new URL(await left.locator(".link-box").innerText()).pathname;
+  const path = await createRoom(left);
   await left.goto(path);
   await right.goto(path);
   await left.getByRole("button", { name: "Войти в звонок" }).click();
   await expect(left.locator(".status")).toContainText("Ждём");
   await right.getByRole("button", { name: "Войти в звонок" }).click();
-  await expect(left.locator(".status")).toHaveText("На связи", { timeout: 25_000 });
-  await expect(right.locator(".status")).toHaveText("На связи", { timeout: 25_000 });
+  await expectLive(left, 25_000);
+  await expectLive(right, 25_000);
   await framesAdvance(left);
   await framesAdvance(right);
   return { left, right, path };
@@ -487,14 +538,12 @@ async function framesAdvance(page: Page): Promise<void> {
 test("permission failure shows recovery guidance", async () => {
   const browser = await chromium.launch({ args: ["--deny-permission-prompts"] });
   const page = await browser.newPage();
-  await page.goto("/");
-  await page.getByRole("button", { name: "Создать ссылку" }).click();
-  const href = await page.locator(".link-box").innerText();
-  await page.goto(new URL(href).pathname);
+  await page.goto(await createRoom(page));
   await page.getByRole("button", { name: "Войти в звонок" }).click();
   // Headless Chromium reports no devices on Linux and "not supported" on macOS. Both must end in visible guidance.
   await expect(page.locator(".media-issue")).toContainText(/камер/u);
-  await expect(page.getByRole("button", { name: "Войти в звонок" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Войти снова" })).toBeVisible();
+  expect(await page.locator(".call").innerText()).not.toMatch(/TURN|Релей/u);
   await page.screenshot({ path: `${artifacts}/wirecall-permission.png` });
   await browser.close();
 });

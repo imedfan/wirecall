@@ -30,6 +30,21 @@ describe("quality ladder", () => {
     expect(TIER_PROFILES.good.targetHeight).toBe(720);
   });
 
+  it("gives up frames first and frame size only on the lowest tier", () => {
+    const { good, ok, weak } = TIER_PROFILES;
+    const lowest = TIER_PROFILES["very-weak"];
+    // Sharpness holds all the way down to the last step.
+    expect([good.targetHeight, ok.targetHeight, weak.targetHeight]).toEqual([720, 720, 720]);
+    expect(lowest.targetHeight).toBe(480);
+    // Even steps of frame rate, strictly down, never below 15.
+    expect([good.maxFramerate, ok.maxFramerate, weak.maxFramerate]).toEqual([30, 20, 15]);
+    expect(good.maxFramerate).toBeGreaterThan(ok.maxFramerate);
+    expect(ok.maxFramerate).toBeGreaterThan(weak.maxFramerate);
+    expect(lowest.maxFramerate).toBeLessThanOrEqual(weak.maxFramerate);
+    expect(lowest.maxFramerate).toBeGreaterThanOrEqual(12);
+    expect([good.maxBitrate, ok.maxBitrate, weak.maxBitrate, lowest.maxBitrate]).toEqual([1_200_000, 800_000, 500_000, 250_000]);
+  });
+
   it("starts on a sensible video tier and ignores a burst inside the sample gap", () => {
     const controller = new AdaptiveController();
     expect(START_TIER).toBe("good");
@@ -133,8 +148,12 @@ describe("quality ladder", () => {
 
   it("steps down when the bitrate estimate cannot carry the current tier", () => {
     const controller = new AdaptiveController();
-    const tiers = feed(controller, { lossRatio: 0, rttMs: 40, availableOutgoingBitrate: 500_000 }, 6, 0);
+    const tiers = feed(controller, { lossRatio: 0, rttMs: 40, availableOutgoingBitrate: 600_000 }, 6, 0);
     expect(tiers[tiers.length - 1]).toBe("ok");
+    // A thinner estimate carries one tier less.
+    const thinner = new AdaptiveController();
+    const lower = feed(thinner, { lossRatio: 0, rttMs: 40, availableOutgoingBitrate: 400_000 }, 8, 0);
+    expect(lower[lower.length - 1]).toBe("weak");
   });
 
   it("holds the tier and does not crash when getStats gives nothing", () => {
@@ -223,13 +242,17 @@ describe("quality ladder", () => {
 
   it("scales by the real frame size and never enlarges", () => {
     expect(scaleForHeight(720, "good")).toBe(1);
-    expect(scaleForHeight(720, "ok")).toBeCloseTo(1.5);
-    expect(scaleForHeight(720, "weak")).toBe(2);
-    expect(scaleForHeight(720, "very-weak")).toBe(3);
-    expect(scaleForHeight(1080, "weak")).toBe(3);
+    // The frame keeps its size until the lowest tier.
+    expect(scaleForHeight(720, "ok")).toBe(1);
+    expect(scaleForHeight(720, "weak")).toBe(1);
+    expect(scaleForHeight(720, "very-weak")).toBeCloseTo(1.5);
+    expect(scaleForHeight(1080, "weak")).toBeCloseTo(1.5);
+    expect(scaleForHeight(1080, "very-weak")).toBeCloseTo(2.25);
     expect(scaleForHeight(360, "good")).toBe(1);
+    expect(scaleForHeight(360, "very-weak")).toBe(1);
     expect(scaleForHeight(undefined, "good")).toBe(1);
-    expect(scaleForHeight(undefined, "weak")).toBe(2);
+    expect(scaleForHeight(undefined, "weak")).toBe(1);
+    expect(scaleForHeight(undefined, "very-weak")).toBeCloseTo(1.5);
   });
 });
 

@@ -1,4 +1,4 @@
-import { AdaptiveController, TIER_ORDER, type QualityTier } from "../shared/adaptive";
+import { AdaptiveController, TIER_ORDER, TIER_PROFILES, type QualityTier } from "../shared/adaptive";
 import { RetryBudget } from "../shared/backoff";
 import { preferredAudioCodecs, preferredVideoCodecs, type CodecCap } from "../shared/codecs";
 import { sanitizeIceServers, type IceServer } from "../shared/ice-servers";
@@ -6,7 +6,7 @@ import { IceBuffer } from "../shared/ice-buffer";
 import { encodeIcePayload, parseIcePayload, PROTOCOL_VERSION } from "../shared/protocol";
 import { shouldCreateOffer, shouldIgnoreOffer, type SignalingState } from "../shared/negotiation";
 import { summarizeStats, type StatCounters, type StatReport, type StatSummary } from "../shared/stats";
-import { encodeQualityMessage, parseQualityMessage, qualityLabel } from "../shared/quality-label";
+import { encodeQualityMessage, parseQualityMessage, tierName } from "../shared/quality-label";
 import { redactLogFields } from "../shared/redact";
 import { isResumeToken } from "../shared/ids";
 import { audioConstraints, type FacingMode, openCallMedia, videoConstraints } from "./open-media";
@@ -27,10 +27,12 @@ export type CallPhase = "idle" | "starting" | "waiting" | "connecting" | "live" 
 
 export interface CallHooks {
   onStatus: (text: string) => void;
-  onDiagnostics: (lines: string[]) => void;
+  /** The few lines a person may want at a glance, then everything else. */
+  onDiagnostics: (main: string[], more: string[]) => void;
   onAudioBlocked: (blocked: boolean) => void;
   onMediaIssue: (reason: "denied" | "missing" | "busy" | "failed" | null) => void;
-  onEnded: (text: string) => void;
+  /** canRejoin is false when joining this room again cannot work, as with a link that has expired. */
+  onEnded: (text: string, canRejoin: boolean) => void;
   onWaiting: (waiting: boolean) => void;
   onPhase?: (phase: CallPhase) => void;
   /** This side's own outgoing leg, and the other person's when they report it over the data channel. */
@@ -136,6 +138,9 @@ export class CallSession {
   private peerTierAt = 0;
   private savedIce: IceServer[] = [];
   private listening = false;
+  private previewJob: Promise<boolean> | null = null;
+  /** Which knob took the last tier. Shown in the diagnostics next to what the encoder really sends. */
+  private tierVia: "parameters" | "constraints" | "none" | null = null;
   private networkTarget: EventTarget | null = null;
   private readonly onVisibility = (): void => {
     if (document.visibilityState === "visible") void this.onForeground();
@@ -157,12 +162,33 @@ export class CallSession {
     private readonly remoteVideo: HTMLVideoElement,
     private readonly hooks: CallHooks,
   ) {
-    this.remoteVideo.srcObject = this.remoteStream;
+    // No stream is attached yet: an empty one given to a video before the page has loaded holds back its load event.
     this.remoteVideo.playsInline = true;
     this.remoteVideo.autoplay = true;
     this.localVideo.playsInline = true;
     this.localVideo.autoplay = true;
     this.localVideo.muted = true;
+  }
+
+  /**
+   * Opens the camera and the microphone for the lobby, before the call. Nothing is sent anywhere.
+   * start() takes the same stream over, so the camera is not opened twice. Resolves to true when there is a picture.
+   */
+  preview(): Promise<boolean> {
+    if (this.started || this.closed || this.localStream) return Promise.resolve(false);
+    this.previewJob ??= (async () => {
+      const media = await this.openMedia();
+      this.previewJob = null;
+      if (!media.ok) return false;
+      // A call that ended while the camera was opening must not leave it on.
+      if (this.closed || this.localStream) {
+        media.stream.getTracks().forEach((track) => track.stop());
+        return false;
+      }
+      this.adoptLocal(media.stream);
+      return media.video;
+    })();
+    return this.previewJob;
   }
 
   async start(): Promise<void> {
@@ -171,41 +197,39 @@ export class CallSession {
     const epoch = this.epoch;
     this.started = true;
     this.closed = false;
-    this.stopMedia();
     this.signalRetry.reset();
     this.rebuilds = 0;
     // A new call judges its own link. It does not start from the weak tier the last one ended on.
     this.quality.reset();
+    this.remoteVideo.srcObject = this.remoteStream;
     this.hooks.onPhase?.("starting");
     this.hooks.onStatus("Включаем камеру и микрофон");
-    const media = await openCallMedia({
-      getUserMedia: (constraints) => navigator.mediaDevices.getUserMedia(constraints),
-      supported: (navigator.mediaDevices.getSupportedConstraints?.() ?? null) as Record<string, boolean> | null,
-      facingMode: this.facing,
-    });
-    if (!this.isCurrent(epoch)) {
-      if (media.ok) media.stream.getTracks().forEach((track) => track.stop());
-      return;
+    // A lobby preview that is still opening is waited for, not raced with a second request for the camera.
+    if (this.previewJob) await this.previewJob.catch(() => false);
+    if (!this.isCurrent(epoch)) return;
+    const kept = this.localStream;
+    if (kept && kept.getTracks().length > 0 && kept.getTracks().every((track) => track.readyState === "live")) {
+      this.hooks.onMediaIssue(null);
+      void this.reportCameras();
+    } else {
+      this.stopMedia();
+      const media = await this.openMedia();
+      if (!this.isCurrent(epoch)) {
+        if (media.ok) media.stream.getTracks().forEach((track) => track.stop());
+        return;
+      }
+      if (!media.ok) {
+        this.started = false;
+        this.hooks.onMediaIssue(media.reason);
+        this.hooks.onStatus(mediaIssueText(media.reason));
+        this.hooks.onPhase?.("idle");
+        return;
+      }
+      this.hooks.onMediaIssue(null);
+      this.adoptLocal(media.stream);
+      void this.reportCameras();
+      if (!media.video) this.hooks.onStatus("Камера недоступна. Звонок со звуком.");
     }
-    if (!media.ok) {
-      this.started = false;
-      this.hooks.onMediaIssue(media.reason);
-      this.hooks.onStatus(mediaIssueText(media.reason));
-      this.hooks.onPhase?.("idle");
-      return;
-    }
-    this.hooks.onMediaIssue(null);
-    this.localStream = media.stream;
-    for (const track of media.stream.getTracks()) {
-      applyMediaIntent(track, this.intent);
-      this.watchTrack(track);
-    }
-    this.heldVideo = media.stream.getVideoTracks()[0] ?? null;
-    this.localVideo.srcObject = media.stream;
-    this.markFacing(media.stream.getVideoTracks()[0]);
-    void this.reportCameras();
-    if (!media.video) this.hooks.onStatus("Камера недоступна. Звонок со звуком.");
-    void this.localVideo.play().catch(() => undefined);
     this.attachLifecycle();
     await this.requestWake(epoch);
     if (!this.isCurrent(epoch)) return;
@@ -214,6 +238,27 @@ export class CallSession {
 
   hangup(): void {
     this.finish("Звонок завершён", true);
+  }
+
+  private openMedia(): ReturnType<typeof openCallMedia> {
+    return openCallMedia({
+      getUserMedia: (constraints) => navigator.mediaDevices.getUserMedia(constraints),
+      supported: (navigator.mediaDevices.getSupportedConstraints?.() ?? null) as Record<string, boolean> | null,
+      facingMode: this.facing,
+    });
+  }
+
+  /** Makes a freshly opened stream the local one: the person's mute choices, the self view, the track watchers. */
+  private adoptLocal(stream: MediaStream): void {
+    this.localStream = stream;
+    for (const track of stream.getTracks()) {
+      applyMediaIntent(track, this.intent);
+      this.watchTrack(track);
+    }
+    this.heldVideo = stream.getVideoTracks()[0] ?? null;
+    this.localVideo.srcObject = stream;
+    this.markFacing(stream.getVideoTracks()[0]);
+    void this.localVideo.play().catch(() => undefined);
   }
 
   toggleAudio(): boolean {
@@ -332,12 +377,12 @@ export class CallSession {
       window.clearTimeout(this.pongTimer);
       this.pongTimer = 0;
       if (NO_RETRY.has(event.code)) {
-        this.finish(closeText(event.code, event.reason), false);
+        this.finish(closeText(event.code, event.reason), false, event.code !== 4004 && event.reason !== "expired");
         return;
       }
       const delay = this.signalRetry.next();
       if (delay === null) {
-        this.finish("Не удалось восстановить связь. Нажмите «Войти снова».", false);
+        this.finish("Связь не восстановилась. Попробуйте войти снова.", false);
         return;
       }
       const epoch = this.epoch;
@@ -759,8 +804,8 @@ export class CallSession {
       run.exhausted = true;
       this.hooks.onStatus(
         this.turnMode === "on"
-          ? "Не получается восстановить связь. Проверьте интернет и нажмите «Переподключить»."
-          : "Прямое соединение через эту сеть не проходит. Проверьте интернет и нажмите «Переподключить».",
+          ? "Связь не восстанавливается. Проверьте интернет."
+          : "Через эту сеть звонок не проходит. Попробуйте другую.",
       );
       return;
     }
@@ -986,7 +1031,7 @@ export class CallSession {
     if (decision.changed) {
       await this.applyTier(decision.tier, epoch);
       if (!this.isCurrent(epoch)) return;
-      // A fresh key frame lets the smaller picture appear at once instead of smearing in.
+      // A fresh key frame lets the cheaper picture appear at once instead of smearing in.
       if (TIER_ORDER.indexOf(decision.tier) < TIER_ORDER.indexOf(before)) requestKeyFrame(this.videoSender());
     }
     this.sendQuality();
@@ -998,7 +1043,8 @@ export class CallSession {
   private async applyTier(tier: QualityTier, epoch: number): Promise<void> {
     const sender = this.videoSender();
     if (!sender || !this.isCurrent(epoch)) return;
-    await applyVideoTier(asVideoSender(sender), tier, this.intent);
+    const result = await applyVideoTier(asVideoSender(sender), tier, this.intent);
+    if (this.isCurrent(epoch)) this.tierVia = result.via;
   }
 
   private publishDiagnostics(summary?: StatSummary): void {
@@ -1007,25 +1053,29 @@ export class CallSession {
     const percent = (value: number | undefined): string => (value === undefined ? "неизвестно" : `${Math.round(value * 1000) / 10}%`);
     const ms = (value: number | undefined): string => (value === undefined ? "неизвестно" : `${value} мс`);
     const kbit = (value: number | undefined): string => (value === undefined ? "неизвестно" : `${Math.round(value / 1000)} кбит/с`);
-    const lines = [
-      `Качество: ${tierLabel(tier)}`,
-      `Оценка связи: ${score === null ? "неизвестно" : `${score} из 100`}`,
-      `У собеседника: ${this.peerTier ? tierLabel(this.peerTier) : "неизвестно"}`,
-      `Маршрут: ${this.route}`,
-      `Релей: ${this.turnMode === "on" ? "включён" : this.turnMode === "error" ? "не ответил, только прямое" : "выключен"}`,
+    const main = [
+      `Качество: ${tierName(tier)}`,
       `Задержка: ${ms(summary?.rttMs)}`,
       `Потери: ${percent(summary?.lossRatio)}`,
+      // What the encoder really sends against the tier's ceiling: the only proof that the limit took hold.
+      `Кадры: ${summary?.framesPerSecond === undefined ? "неизвестно" : `${Math.round(summary.framesPerSecond)} из ${TIER_PROFILES[tier].maxFramerate}`}`,
+      `Размер: ${summary?.width && summary?.height ? `${summary.width}×${summary.height}` : "неизвестно"}`,
+    ];
+    const more = [
+      `Оценка связи: ${score === null ? "неизвестно" : `${score} из 100`}`,
+      `Ограничение видео: ${this.tierVia === "parameters" ? "параметры отправителя" : this.tierVia === "constraints" ? "настройки камеры" : this.tierVia === "none" ? "не применилось" : "неизвестно"}`,
+      `У собеседника: ${this.peerTier ? tierName(this.peerTier) : "неизвестно"}`,
+      `Маршрут: ${this.route}`,
+      `Релей: ${this.turnMode === "on" ? "включён" : this.turnMode === "error" ? "не ответил, только прямое" : "выключен"}`,
       `Потери на приёме: ${percent(summary?.inboundLossRatio)}`,
       `Джиттер: ${ms(summary?.jitterMs)}`,
       `Битрейт: ${kbit(summary?.bitrate)}`,
       `Доступная полоса: ${kbit(summary?.availableOutgoingBitrate)}`,
       `Ограничение кодера: ${limitLabel(summary?.encoderLimit)}`,
-      `Кадры: ${summary?.framesPerSecond === undefined ? "неизвестно" : String(Math.round(summary.framesPerSecond))}`,
-      `Размер: ${summary?.width && summary?.height ? `${summary.width}×${summary.height}` : "неизвестно"}`,
       `Пропущенные кадры: ${percent(summary?.framesDroppedRatio)}`,
       `Восполнение звука: ${percent(summary?.concealmentRatio)}`,
     ];
-    this.hooks.onDiagnostics(lines);
+    this.hooks.onDiagnostics(main, more);
     if (debugEnabled()) {
       // Numbers and tier names only. The same filter as the server logs drops anything that could carry SDP, ICE or a token.
       console.debug("wirecall", redactLogFields({ tier, score, peerTier: this.peerTier, route: this.route, ...numbersOf(summary) }));
@@ -1080,9 +1130,9 @@ export class CallSession {
       this.localVideo.srcObject = stream;
       void this.localVideo.play().catch(() => undefined);
       await this.applyTier(this.quality.current(), epoch);
-      if (this.isCurrent(epoch)) this.hooks.onStatus("Устройства восстановлены в том состоянии, в котором вы их оставили.");
+      if (this.isCurrent(epoch)) this.hooks.onStatus("Камера и микрофон снова работают");
     } catch {
-      if (this.isCurrent(epoch)) this.hooks.onStatus("После возвращения в Safari доступ к камере нужно разрешить снова");
+      if (this.isCurrent(epoch)) this.hooks.onStatus("Разрешите камеру и микрофон ещё раз");
     } finally {
       this.restoring = false;
     }
@@ -1090,9 +1140,9 @@ export class CallSession {
 
   /** A track ends when headphones disconnect or iOS takes the camera away. It is reopened once the page is visible. */
   private watchTrack(track: MediaStreamTrack): void {
-    // Tells the encoder what matters: clear speech for the microphone, smooth motion for a face.
+    // Tells the encoder what matters: clear speech for the microphone, a sharp picture for a face.
     try {
-      track.contentHint = track.kind === "audio" ? "speech" : "motion";
+      track.contentHint = track.kind === "audio" ? "speech" : "detail";
     } catch {
       // Not every browser has the hint.
     }
@@ -1187,7 +1237,7 @@ export class CallSession {
     return this.pc?.getSenders().find((item) => item.track?.kind === "video");
   }
 
-  private finish(text: string, notifyServer: boolean): void {
+  private finish(text: string, notifyServer: boolean, canRejoin = true): void {
     this.epoch += 1;
     this.closed = true;
     this.started = false;
@@ -1201,12 +1251,13 @@ export class CallSession {
     this.socketReady = false;
     this.stopMedia();
     this.clearRemote();
-    this.hooks.onEnded(text);
+    this.hooks.onEnded(text, canRejoin);
     this.hooks.onPhase?.("ended");
   }
 
+  /** A working call has nothing to announce. The status line speaks only when something needs saying. */
   private linkStatus(): string {
-    return "На связи";
+    return "";
   }
 
   private stopMedia(): void {
@@ -1334,22 +1385,18 @@ function writeToken(key: string, value: string): void {
   }
 }
 
-function tierLabel(tier: QualityTier): string {
-  return qualityLabel(tier).replace(/^Связь /u, "");
-}
-
 function mediaIssueText(reason: "denied" | "missing" | "busy" | "failed"): string {
-  if (reason === "denied") return "Нет разрешения на камеру или микрофон";
+  if (reason === "denied") return "Нет доступа к камере и микрофону";
   if (reason === "missing") return "Камера или микрофон не найдены";
-  if (reason === "busy") return "Камера или микрофон заняты другим приложением";
-  return "Не удалось включить камеру и микрофон";
+  if (reason === "busy") return "Камера или микрофон заняты";
+  return "Не получилось включить камеру и микрофон";
 }
 
 function closeText(code: number, reason: string): string {
-  if (code === 4000 || reason === "room-full") return "В комнате уже двое. Попросите освободить место или создайте новую ссылку.";
+  if (code === 4000 || reason === "room-full") return "В комнате уже двое. Создайте новую ссылку.";
   if (code === 4002 || reason === "replaced") return "Эта комната открыта в другом окне.";
   if (code === 4004 || reason === "expired") return "Ссылка устарела. Создайте новую.";
-  if (reason === "rate") return "Слишком много попыток подряд. Подождите немного.";
+  if (reason === "rate") return "Слишком много попыток. Подождите немного.";
   if (code === 1000) return "Звонок завершён";
   return "Соединение закрыто";
 }

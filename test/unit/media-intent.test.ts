@@ -4,10 +4,11 @@ import {
   applyMediaIntent,
   applyVideoTier,
   AUDIO_MAX_BITRATE,
-  captureSize,
+  frameSize,
   freshMediaIntent,
   toggleMediaIntent,
   tuneAudioSender,
+  type CaptureLimits,
   type SenderParameters,
   type VideoSenderControl,
   type VideoTrackControl,
@@ -16,13 +17,17 @@ import {
 class Track implements VideoTrackControl {
   enabled = true;
   stopped = false;
-  constraints: { width?: number; height?: number; frameRate?: number } | null = null;
+  constraints: CaptureLimits | null = null;
+  applied: CaptureLimits[] = [];
   constructor(
     readonly kind: "audio" | "video",
-    private readonly size: { width?: number; height?: number } = { width: 1280, height: 720 },
+    private size: { width?: number; height?: number } = { width: 1280, height: 720 },
   ) {}
-  applyConstraints(constraints: { width?: number; height?: number; frameRate?: number }): Promise<void> {
+  applyConstraints(constraints: CaptureLimits): Promise<void> {
     this.constraints = constraints;
+    this.applied.push(constraints);
+    // Like a camera: it delivers the size it was asked for.
+    if (constraints.width && constraints.height) this.size = { width: constraints.width, height: constraints.height };
     return Promise.resolve();
   }
   getSettings(): { width?: number; height?: number } {
@@ -85,7 +90,7 @@ describe("video tier limits", () => {
       expect(encoding.maxBitrate).toBe(TIER_PROFILES[tier].maxBitrate);
       expect(encoding.maxFramerate).toBe(TIER_PROFILES[tier].maxFramerate);
       expect(encoding.scaleResolutionDownBy).toBeGreaterThanOrEqual(1);
-      expect(state.degradationPreference).toBe("balanced");
+      expect(state.degradationPreference).toBe("maintain-resolution");
       expect(state.replaced).toBe(0);
       expect(control.track).toBe(track);
       expect(track.enabled).toBe(true);
@@ -98,7 +103,7 @@ describe("video tier limits", () => {
     const track = new Track("video");
     const { control, state } = sender(track);
     await applyVideoTier(control, "very-weak", freshMediaIntent());
-    expect(state.encodings[0]).toMatchObject({ active: true, maxBitrate: 150_000, maxFramerate: 15, scaleResolutionDownBy: 3 });
+    expect(state.encodings[0]).toMatchObject({ active: true, maxBitrate: 250_000, maxFramerate: 15, scaleResolutionDownBy: 1.5 });
     expect(state.replaced).toBe(0);
     expect(track.enabled).toBe(true);
   });
@@ -132,8 +137,22 @@ describe("video tier limits", () => {
     const { control, state } = sender(upright);
     await applyVideoTier(control, "good", freshMediaIntent());
     expect(state.encodings[0]?.scaleResolutionDownBy).toBe(1);
-    await applyVideoTier(control, "weak", freshMediaIntent());
-    expect(state.encodings[0]?.scaleResolutionDownBy).toBe(2);
+    // Fewer frames, same size, down to the last step.
+    for (const tier of ["ok", "weak"] as const) {
+      await applyVideoTier(control, tier, freshMediaIntent());
+      expect(state.encodings[0]?.scaleResolutionDownBy).toBe(1);
+      expect(state.encodings[0]?.maxFramerate).toBe(TIER_PROFILES[tier].maxFramerate);
+    }
+    await applyVideoTier(control, "very-weak", freshMediaIntent());
+    expect(state.encodings[0]?.scaleResolutionDownBy).toBeCloseTo(1.5);
+  });
+
+  it("asks the encoder to keep the resolution and lower the frame rate", async () => {
+    const { control, state } = sender(new Track("video"));
+    await applyVideoTier(control, "ok", freshMediaIntent());
+    expect(state.calls).toHaveLength(1);
+    expect(state.calls[0]?.degradationPreference).toBe("maintain-resolution");
+    expect(state.encodings[0]).toMatchObject({ maxFramerate: 20, maxBitrate: 800_000, scaleResolutionDownBy: 1 });
   });
 
   it("sends the limits again without the degradation preference when a browser rejects it", async () => {
@@ -141,7 +160,10 @@ describe("video tier limits", () => {
     const { control, state } = sender(track, (params) => params.degradationPreference !== undefined);
     const result = await applyVideoTier(control, "ok", freshMediaIntent());
     expect(result.via).toBe("parameters");
-    expect(state.encodings[0]?.maxBitrate).toBe(600_000);
+    expect(state.calls).toHaveLength(2);
+    expect(state.calls[0]?.degradationPreference).toBe("maintain-resolution");
+    expect(state.calls[1]?.degradationPreference).toBeUndefined();
+    expect(state.encodings[0]).toMatchObject({ maxBitrate: 800_000, maxFramerate: 20, scaleResolutionDownBy: 1 });
   });
 
   it("falls back to capture constraints in the camera's own proportions when setParameters fails", async () => {
@@ -150,18 +172,43 @@ describe("video tier limits", () => {
     const { control, state } = sender(upright, () => true);
     const result = await applyVideoTier(control, "weak", { micEnabled: false, cameraEnabled: false });
     expect(result).toEqual({ applied: true, via: "constraints" });
-    expect(upright.constraints).toEqual({ width: 360, height: 640, frameRate: 20 });
+    // Only the frame rate changes. The size is named at its current value, so the camera has no reason to pick another.
+    expect(upright.constraints).toEqual({ width: 720, height: 1280, frameRate: 15 });
     expect(upright.enabled).toBe(false);
     expect(state.replaced).toBe(0);
 
     const wide = new Track("video", { width: 1280, height: 720 });
-    await applyVideoTier(sender(wide, () => true).control, "weak", freshMediaIntent());
-    expect(wide.constraints).toEqual({ width: 640, height: 360, frameRate: 20 });
+    const wideSender = sender(wide, () => true).control;
+    await applyVideoTier(wideSender, "ok", freshMediaIntent());
+    expect(wide.constraints).toEqual({ width: 1280, height: 720, frameRate: 20 });
+    await applyVideoTier(wideSender, "weak", freshMediaIntent());
+    expect(wide.constraints).toEqual({ width: 1280, height: 720, frameRate: 15 });
+  });
+
+  it("shrinks the capture only on the lowest tier and restores it on the way back up", async () => {
+    const upright = new Track("video", { width: 720, height: 1280 });
+    const { control } = sender(upright, () => true);
+    await applyVideoTier(control, "weak", freshMediaIntent());
+    await applyVideoTier(control, "very-weak", freshMediaIntent());
+    expect(upright.constraints).toEqual({ width: 480, height: 853, frameRate: 15 });
+    // The camera now reports the small frame. The size it had at first is what the next tier returns to.
+    await applyVideoTier(control, "weak", freshMediaIntent());
+    expect(upright.constraints).toEqual({ width: 720, height: 1280, frameRate: 15 });
+    await applyVideoTier(control, "good", freshMediaIntent());
+    expect(upright.constraints).toEqual({ width: 720, height: 1280, frameRate: 30 });
+    expect(upright.applied.filter((item) => item.width !== 720)).toHaveLength(1);
+  });
+
+  it("changes the frame rate alone when the camera does not report its size", async () => {
+    const blind = new Track("video", {});
+    await applyVideoTier(sender(blind, () => true).control, "weak", freshMediaIntent());
+    expect(blind.constraints).toEqual({ frameRate: 15 });
   });
 
   it("never asks the camera for a larger frame than it gives", () => {
-    expect(captureSize({ width: 640, height: 360 }, 720, 30)).toEqual({ width: 640, height: 360, frameRate: 30 });
-    expect(captureSize({}, 360, 20)).toEqual({ height: 360, frameRate: 20 });
+    expect(frameSize({ width: 640, height: 360 }, 720)).toEqual({ width: 640, height: 360 });
+    expect(frameSize({ width: 1280, height: 720 }, 480)).toEqual({ width: 853, height: 480 });
+    expect(frameSize({}, 480)).toEqual({});
   });
 });
 
