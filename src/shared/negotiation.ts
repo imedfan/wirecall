@@ -4,6 +4,11 @@ export function offerCollides(makingOffer: boolean, signalingState: SignalingSta
   return makingOffer || signalingState !== "stable";
 }
 
+export function shouldCreateOffer(input: { polite: boolean; iceRestart: boolean }): boolean {
+  // The polite peer answers. A simultaneous initial offer rolls back gathering and can leave ICE in "new".
+  return !input.polite || input.iceRestart;
+}
+
 export function shouldIgnoreOffer(input: {
   polite: boolean;
   makingOffer: boolean;

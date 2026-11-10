@@ -4,7 +4,7 @@ import { preferredAudioCodecs, preferredVideoCodecs, type CodecCap } from "../sh
 import { sanitizeIceServers, type IceServer } from "../shared/ice-servers";
 import { IceBuffer } from "../shared/ice-buffer";
 import { encodeIcePayload, parseIcePayload } from "../shared/protocol";
-import { shouldIgnoreOffer, type SignalingState } from "../shared/negotiation";
+import { shouldCreateOffer, shouldIgnoreOffer, type SignalingState } from "../shared/negotiation";
 import { summarizeStats, type StatCounters, type StatReport } from "../shared/stats";
 import { isResumeToken } from "../shared/ids";
 import { type FacingMode, openCallMedia } from "./open-media";
@@ -375,6 +375,7 @@ export class CallSession {
     const pc = this.pc;
     const epoch = this.epoch;
     if (!this.isCurrent(epoch) || !pc || this.peerCount < 2 || this.makingOffer || pc.signalingState !== "stable") return;
+    if (!shouldCreateOffer({ polite: this.polite, iceRestart: this.iceRestart })) return;
     this.makingOffer = true;
     try {
       const offer = await pc.createOffer({ iceRestart: this.iceRestart });

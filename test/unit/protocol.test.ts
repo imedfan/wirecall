@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { IceBuffer } from "../../src/shared/ice-buffer";
 import { parseTurnCredentialResponse, sanitizeIceServers } from "../../src/shared/ice-servers";
-import { shouldIgnoreOffer } from "../../src/shared/negotiation";
+import { shouldCreateOffer, shouldIgnoreOffer } from "../../src/shared/negotiation";
 import { authorizeCreate, originAllowed } from "../../src/shared/origin";
 import { encodeIcePayload, parseClientMessage } from "../../src/shared/protocol";
 import { preferredAudioCodecs, preferredVideoCodecs } from "../../src/shared/codecs";
@@ -43,6 +43,9 @@ describe("signaling validation", () => {
     expect(buffer.push("two")).toEqual(["two"]);
     buffer.reset();
     expect(buffer.push("three")).toEqual([]);
+    expect(shouldCreateOffer({ polite: true, iceRestart: false })).toBe(false);
+    expect(shouldCreateOffer({ polite: true, iceRestart: true })).toBe(true);
+    expect(shouldCreateOffer({ polite: false, iceRestart: false })).toBe(true);
     expect(shouldIgnoreOffer({ polite: false, makingOffer: true, signalingState: "have-local-offer", descriptionType: "offer" })).toBe(true);
     expect(shouldIgnoreOffer({ polite: true, makingOffer: true, signalingState: "have-local-offer", descriptionType: "offer" })).toBe(false);
     expect(shouldIgnoreOffer({ polite: false, makingOffer: false, signalingState: "stable", descriptionType: "answer" })).toBe(false);
