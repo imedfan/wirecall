@@ -220,6 +220,7 @@ video.local {
 }
 
 .banner {
+  grid-column: 1 / -1;
   margin: 0;
   padding: 12px 14px;
   background: #fff4df;

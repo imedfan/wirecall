@@ -57,6 +57,7 @@ export class CallSession {
   private turnMode: WelcomeMessage["turnMode"] = "off";
   private route = "неизвестно";
   private started = false;
+  private iceGraceUntil = 0;
   private earlySignals: { kind: "offer" | "answer" | "ice"; payload: string }[] = [];
 
   constructor(
@@ -266,6 +267,7 @@ export class CallSession {
     if (this.pc) return;
     const pc = new RTCPeerConnection({ iceServers: sanitizeIceServers(iceServers) });
     this.pc = pc;
+    this.iceGraceUntil = Date.now() + 5_000;
     this.iceBuffer.reset();
     for (const track of this.localStream?.getTracks() ?? []) pc.addTrack(track, this.localStream!);
     this.preferCodecs(pc);
@@ -360,7 +362,6 @@ export class CallSession {
     }
     const current = this.pc;
     if (!current) return;
-    this.iceBuffer.reset();
     try {
       await current.setRemoteDescription({ type: kind, sdp });
       for (const payload of this.iceBuffer.markReady()) await this.addIce(payload);
@@ -391,17 +392,23 @@ export class CallSession {
 
   private onIceState(state: RTCIceConnectionState): void {
     window.clearTimeout(this.disconnectedTimer);
+    this.remoteVideo.dataset.ice = state;
     if (state === "connected" || state === "completed") {
       this.iceRetry.reset();
+      this.hooks.onWaiting(false);
+      this.hooks.onStatus(this.quality.current() === "audio-only" ? "На связи, только звук" : "На связи");
       return;
     }
+    if (Date.now() < this.iceGraceUntil && state !== "failed") return;
     if (state === "failed") {
       this.scheduleIceRestart();
       return;
     }
     if (state === "disconnected") {
       this.hooks.onStatus("Связь пропала. Восстанавливаем.");
-      this.disconnectedTimer = window.setTimeout(() => this.scheduleIceRestart(), 3000);
+      this.disconnectedTimer = window.setTimeout(() => {
+        if (this.pc?.iceConnectionState === "disconnected") this.scheduleIceRestart();
+      }, 3_000);
     }
   }
 

@@ -5,7 +5,12 @@ const artifacts = "/opt/cursor/artifacts";
 
 async function launch(): Promise<Browser> {
   return chromium.launch({
-    args: ["--use-fake-device-for-media-stream", "--use-fake-ui-for-media-stream", "--autoplay-policy=no-user-gesture-required"],
+    args: [
+      "--use-fake-device-for-media-stream",
+      "--use-fake-ui-for-media-stream",
+      "--autoplay-policy=no-user-gesture-required",
+      "--disable-features=WebRtcHideLocalIpsWithMdns",
+    ],
   });
 }
 
@@ -56,7 +61,7 @@ test("permission failure shows recovery guidance", async () => {
   const href = await page.locator(".link-box").innerText();
   await page.goto(new URL(href).pathname);
   await page.getByRole("button", { name: "Войти в звонок" }).click();
-  await expect(page.locator(".hint")).toContainText("Разрешите камеру и микрофон");
+  await expect(page.locator(".media-issue")).toContainText("не показало камеру или микрофон");
   await page.screenshot({ path: `${artifacts}/wirecall-permission.png` });
   await browser.close();
 });

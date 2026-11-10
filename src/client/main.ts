@@ -114,7 +114,7 @@ async function renderCall(root: HTMLElement, roomId: string): Promise<void> {
   const join = button("Войти в звонок");
   join.classList.add("wide");
   const issue = document.createElement("p");
-  issue.className = "hint";
+  issue.className = "hint media-issue";
   issue.hidden = true;
   const audio = button("Включить звук");
   audio.classList.add("wide");
@@ -174,7 +174,7 @@ async function renderCall(root: HTMLElement, roomId: string): Promise<void> {
         join.textContent = "Войти снова";
       },
       onWaiting: (waiting) => {
-        if (waiting) status.textContent = "Ждём второго человека";
+        status.textContent = waiting ? "Ждём второго человека" : "Соединяем";
       },
     });
     return session;
