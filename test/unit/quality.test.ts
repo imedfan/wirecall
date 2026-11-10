@@ -1,14 +1,24 @@
 import { describe, expect, it } from "vitest";
 import { TIER_ORDER } from "../../src/shared/adaptive";
-import { encodeQualityMessage, parseQualityMessage, qualityBadge, qualityBars, qualityLabel } from "../../src/shared/quality-label";
+import { encodeQualityMessage, parseQualityMessage, qualityBadge, qualityBars, qualityLabel, tierName } from "../../src/shared/quality-label";
 import { summarizeStats, type StatReport } from "../../src/shared/stats";
 
 describe("quality badge", () => {
-  it("names every tier in Russian and says when the video was lowered", () => {
+  it("names every tier in Russian and says that frames come less often, not that the video got worse", () => {
     expect(qualityLabel("good")).toBe("Связь хорошая");
-    expect(qualityLabel("ok")).toBe("Связь нормальная");
-    expect(qualityLabel("weak")).toBe("Связь слабая, качество видео снижено");
-    expect(qualityLabel("very-weak")).toBe("Связь очень слабая, качество видео снижено");
+    expect(qualityLabel("ok")).toBe("Связь нормальная · кадры реже");
+    expect(qualityLabel("weak")).toBe("Связь слабая · кадры реже");
+    expect(qualityLabel("very-weak")).toBe("Связь слабая · кадры реже");
+    for (const tier of TIER_ORDER) {
+      for (const peer of [null, ...TIER_ORDER]) {
+        const badge = qualityBadge(tier, peer);
+        expect(`${badge.text} ${badge.peerText ?? ""} ${badge.spoken}`).not.toContain("качество видео снижено");
+      }
+      if (tier !== "good") expect(qualityLabel(tier)).toContain("кадры реже");
+    }
+    expect(qualityLabel("good")).not.toContain("кадры реже");
+    // The diagnostics sheet still tells the two lowest tiers apart.
+    expect(TIER_ORDER.map(tierName)).toEqual(["очень слабая", "слабая", "нормальная", "хорошая"]);
   });
 
   it("carries the meaning in text and bar count, not in colour alone", () => {
@@ -26,6 +36,9 @@ describe("quality badge", () => {
 
   it("mentions the other person only when their tier is really known", () => {
     expect(qualityBadge("good", null).spoken).not.toContain("собеседник");
+    // A good link on the other side is not worth a line.
+    expect(qualityBadge("ok", "good").peerText).toBeNull();
+    expect(qualityBadge("ok", "ok").peerText).toBe("У собеседника связь нормальная");
     const both = qualityBadge("good", "weak");
     expect(both.peerText).toBe("У собеседника связь слабая");
     expect(both.spoken).toBe("Связь хорошая. У собеседника связь слабая.");

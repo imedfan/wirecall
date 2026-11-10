@@ -1,6 +1,7 @@
 /**
- * Quality ladder for outgoing video. Every tier keeps the picture: a weak link gets a smaller,
- * slower, cheaper video, never none. Only the person turns the camera off. Audio is not touched here.
+ * Quality ladder for outgoing video. Every tier keeps the picture: a weak link gets fewer frames a second
+ * first, because in a conversation a sharp face matters more than smooth motion. The frame itself shrinks
+ * only on the lowest tier. Only the person turns the camera off. Audio is not touched here.
  */
 export type QualityTier = "good" | "ok" | "weak" | "very-weak";
 
@@ -42,9 +43,10 @@ export const START_TIER: QualityTier = "good";
 
 export const TIER_PROFILES: Record<QualityTier, TierProfile> = {
   good: { tier: "good", maxBitrate: 1_200_000, maxFramerate: 30, targetHeight: 720 },
-  ok: { tier: "ok", maxBitrate: 600_000, maxFramerate: 24, targetHeight: 480 },
-  weak: { tier: "weak", maxBitrate: 300_000, maxFramerate: 20, targetHeight: 360 },
-  "very-weak": { tier: "very-weak", maxBitrate: 150_000, maxFramerate: 15, targetHeight: 240 },
+  ok: { tier: "ok", maxBitrate: 800_000, maxFramerate: 20, targetHeight: 720 },
+  weak: { tier: "weak", maxBitrate: 500_000, maxFramerate: 15, targetHeight: 720 },
+  // 15 and not 12: an even frame interval at 12 depends on the encoder, and that is not known in advance.
+  "very-weak": { tier: "very-weak", maxBitrate: 250_000, maxFramerate: 15, targetHeight: 480 },
 };
 
 const MIN_SAMPLE_GAP_MS = 1_500;
