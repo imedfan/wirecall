@@ -58,7 +58,7 @@ describe("signaling validation", () => {
     expect(shouldIgnoreOffer({ polite: false, makingOffer: false, signalingState: "stable", descriptionType: "answer" })).toBe(false);
   });
 
-  it("prefers H264 then VP8, puts Opus first, and filters TURN credentials", () => {
+  it("prefers H264 then VP8, keeps VP9 and AV1 last, puts Opus first, and filters TURN credentials", () => {
     const video = preferredVideoCodecs([
       { mimeType: "video/VP9" },
       { mimeType: "video/VP8" },
@@ -70,7 +70,11 @@ describe("signaling validation", () => {
       "packetization-mode=1",
       "packetization-mode=0",
       "video/VP8",
+      "video/VP9",
+      "video/AV1",
     ]);
+    const withRepair = preferredVideoCodecs([{ mimeType: "video/rtx" }, { mimeType: "video/AV1" }, { mimeType: "video/H264" }, { mimeType: "video/ulpfec" }]);
+    expect(withRepair.map((codec) => codec.mimeType)).toEqual(["video/H264", "video/AV1", "video/rtx", "video/ulpfec"]);
     expect(preferredAudioCodecs([{ mimeType: "audio/PCMU" }, { mimeType: "audio/opus" }])[0]?.mimeType).toBe("audio/opus");
     const servers = parseTurnCredentialResponse({
       iceServers: [

@@ -19,7 +19,9 @@ export function audioConstraints(supported: Record<string, boolean> | null): Med
     !supported || Object.keys(supported).length === 0
       ? [...AUDIO_KEYS]
       : AUDIO_KEYS.filter((key) => supported[key]);
-  const audio: MediaTrackConstraints & { voiceIsolation?: boolean } = {};
+  // One channel is enough for a voice and halves what the link has to carry.
+  // No sampleRate: Safari answers a forced one with OverconstrainedError.
+  const audio: MediaTrackConstraints & { voiceIsolation?: boolean } = { channelCount: { ideal: 1 } };
   for (const key of keys) audio[key] = true;
   if (supported?.voiceIsolation) audio.voiceIsolation = true;
   return audio;

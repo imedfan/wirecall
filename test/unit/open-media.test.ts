@@ -40,5 +40,7 @@ describe("camera permission fallback", () => {
     const audio = audioConstraints({ echoCancellation: true, noiseSuppression: true, autoGainControl: false, voiceIsolation: true });
     expect(audio).toMatchObject({ echoCancellation: true, noiseSuppression: true, voiceIsolation: true });
     expect(audio).not.toHaveProperty("autoGainControl");
+    expect(audio).toMatchObject({ channelCount: { ideal: 1 } });
+    expect(audio).not.toHaveProperty("sampleRate");
   });
 });

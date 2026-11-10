@@ -27,7 +27,7 @@ export interface VideoTrackControl {
   kind: string;
   enabled: boolean;
   applyConstraints(constraints: { width?: number; height?: number; frameRate?: number }): Promise<void>;
-  getSettings(): { height?: number };
+  getSettings(): { width?: number; height?: number };
 }
 
 export interface VideoEncoding {
@@ -35,43 +35,46 @@ export interface VideoEncoding {
   maxBitrate?: number;
   maxFramerate?: number;
   scaleResolutionDownBy?: number;
+  priority?: string;
+  networkPriority?: string;
+}
+
+export interface SenderParameters {
+  encodings: VideoEncoding[];
+  degradationPreference?: string;
 }
 
 export interface VideoSenderControl {
   track: VideoTrackControl | null;
-  getParameters(): { encodings: VideoEncoding[]; degradationPreference?: "balanced" | "maintain-framerate" | "maintain-resolution" };
-  setParameters(params: { encodings: VideoEncoding[]; degradationPreference?: "balanced" | "maintain-framerate" | "maintain-resolution" }): Promise<void>;
-  replaceTrack(track: VideoTrackControl | null): Promise<void>;
+  getParameters(): SenderParameters;
+  setParameters(params: SenderParameters): Promise<void>;
+}
+
+export interface AudioSenderControl {
+  getParameters(): SenderParameters;
+  setParameters(params: SenderParameters): Promise<void>;
 }
 
 export interface VideoTierResult {
-  videoPaused: boolean;
+  /** The limits are in force, by sender parameters or by capture constraints. */
   applied: boolean;
+  via: "parameters" | "constraints" | "none";
 }
 
-export async function applyVideoTier(
-  sender: VideoSenderControl,
-  tier: QualityTier,
-  intent: MediaIntent,
-  heldVideo: VideoTrackControl | null,
-): Promise<VideoTierResult> {
-  if (heldVideo) applyMediaIntent(heldVideo, intent);
-  if (sender.track && sender.track !== heldVideo) applyMediaIntent(sender.track, intent);
+/** Speech stays clear at this rate, and it leaves the rest of a thin link to the picture. */
+export const AUDIO_MAX_BITRATE = 40_000;
 
-  if (tier === "audio-only") return pauseVideo(sender, intent, heldVideo);
-
-  if (sender.track === null && heldVideo) {
-    try {
-      await sender.replaceTrack(heldVideo);
-    } catch {
-      applyMediaIntent(heldVideo, intent);
-      return { videoPaused: true, applied: false };
-    }
-    applyMediaIntent(heldVideo, intent);
-    if (sender.track === null) return { videoPaused: true, applied: false };
-  }
+/**
+ * Puts a tier's limits on outgoing video: bitrate, frame rate and frame size. It only ever makes the
+ * video cheaper. It never deactivates the encoding, detaches the track or disables it: the picture
+ * stays on every tier, and only the person's own camera button turns it off.
+ */
+export async function applyVideoTier(sender: VideoSenderControl, tier: QualityTier, intent: MediaIntent): Promise<VideoTierResult> {
+  const track = sender.track;
+  if (track) applyMediaIntent(track, intent);
   const profile = TIER_PROFILES[tier];
-  const height = (sender.track ?? heldVideo)?.getSettings().height;
+  const settings = track?.getSettings() ?? {};
+  const shortSide = shorter(settings.width, settings.height);
   try {
     // setParameters only accepts the object getParameters returned (transactionId, codecs), with fields changed in place.
     const params = sender.getParameters();
@@ -80,83 +83,78 @@ export async function applyVideoTier(
       active: true,
       maxBitrate: profile.maxBitrate,
       maxFramerate: profile.maxFramerate,
-      scaleResolutionDownBy: scaleForHeight(height, tier),
+      scaleResolutionDownBy: scaleForHeight(shortSide, tier),
     };
-    params.degradationPreference = "balanced";
-    await sender.setParameters(params);
-    const active = sender.getParameters().encodings[0]?.active;
-    if (active !== false) {
-      const track = sender.track ?? heldVideo;
-      if (track) applyMediaIntent(track, intent);
-      return { videoPaused: false, applied: true };
+    try {
+      params.degradationPreference = "balanced";
+      await sender.setParameters(params);
+    } catch {
+      // Some browsers reject the preference. The limits matter more, so they are sent again without it.
+      const plain = sender.getParameters();
+      plain.encodings[0] = { ...(plain.encodings[0] ?? {}), ...params.encodings[0] };
+      await sender.setParameters(plain);
     }
+    if (track) applyMediaIntent(track, intent);
+    return { applied: true, via: "parameters" };
   } catch {
-    // Some Safari versions reject encoding fields. Resolution constraints are the fallback.
+    // Some Safari versions reject encoding fields. Capture constraints are the fallback.
   }
-  const track = sender.track ?? heldVideo;
-  if (!track) return { videoPaused: false, applied: false };
+  if (!track) return { applied: false, via: "none" };
   try {
-    await track.applyConstraints({
-      width: profile.targetHeight * (16 / 9),
-      height: profile.targetHeight,
-      frameRate: profile.maxFramerate,
-    });
+    await track.applyConstraints(captureSize(settings, profile.targetHeight, profile.maxFramerate));
     applyMediaIntent(track, intent);
-    return { videoPaused: false, applied: true };
+    return { applied: true, via: "constraints" };
   } catch {
     applyMediaIntent(track, intent);
-    return { videoPaused: false, applied: false };
+    return { applied: false, via: "none" };
   }
 }
 
-async function pauseVideo(
-  sender: VideoSenderControl,
-  intent: MediaIntent,
-  heldVideo: VideoTrackControl | null,
-): Promise<VideoTierResult> {
+/**
+ * Keeps the proportions the camera really delivers. An iPhone held upright is 720 by 1280,
+ * and forcing 16:9 on it would crop or fail.
+ */
+export function captureSize(
+  settings: { width?: number; height?: number },
+  targetShortSide: number,
+  frameRate: number,
+): { width?: number; height?: number; frameRate: number } {
+  const { width, height } = settings;
+  if (!width || !height) return { height: targetShortSide, frameRate };
+  const scale = Math.min(1, targetShortSide / Math.min(width, height));
+  return { width: Math.round(width * scale), height: Math.round(height * scale), frameRate };
+}
+
+/**
+ * Voice goes first on a thin link. The cap keeps Opus modest so the adaptation never has to touch it,
+ * and the priority asks the browser to send audio packets ahead of video.
+ */
+export async function tuneAudioSender(sender: AudioSenderControl): Promise<"priority" | "bitrate" | "none"> {
   try {
     const params = sender.getParameters();
-    params.encodings[0] = { ...(params.encodings[0] ?? {}), active: false };
+    if (!params.encodings[0]) return "none";
+    params.encodings[0].maxBitrate = AUDIO_MAX_BITRATE;
+    params.encodings[0].priority = "high";
+    params.encodings[0].networkPriority = "high";
     await sender.setParameters(params);
-    if (sender.getParameters().encodings[0]?.active === false) {
-      if (heldVideo) applyMediaIntent(heldVideo, intent);
-      return { videoPaused: true, applied: true };
-    }
+    return "priority";
   } catch {
-    // Verified inactivity is required before the UI may say video stopped.
+    // The priority fields are not accepted everywhere. The cap alone is still worth having.
   }
   try {
-    await sender.replaceTrack(null);
-    if (sender.track === null) {
-      if (heldVideo) applyMediaIntent(heldVideo, intent);
-      return { videoPaused: true, applied: true };
-    }
+    const params = sender.getParameters();
+    if (!params.encodings[0]) return "none";
+    delete params.encodings[0].priority;
+    delete params.encodings[0].networkPriority;
+    params.encodings[0].maxBitrate = AUDIO_MAX_BITRATE;
+    await sender.setParameters(params);
+    return "bitrate";
   } catch {
-    // Leave the outgoing track untouched.
+    return "none";
   }
-  if (heldVideo) applyMediaIntent(heldVideo, intent);
-  return { videoPaused: false, applied: false };
 }
 
-export function describeTierChange(input: {
-  tier: QualityTier;
-  previousPaused: boolean;
-  failureAnnounced: boolean;
-  result: VideoTierResult;
-}): { videoPaused: boolean; status: string | null; failureAnnounced: boolean } {
-  if (input.tier !== "audio-only") {
-    return { videoPaused: input.result.videoPaused, status: null, failureAnnounced: false };
-  }
-  if (input.result.videoPaused) {
-    return {
-      videoPaused: true,
-      status: input.previousPaused ? null : "Связь слабая. Оставили звук.",
-      failureAnnounced: false,
-    };
-  }
-  return {
-    videoPaused: false,
-    status: input.failureAnnounced ? null : "Связь слабая. Видео не удалось остановить.",
-    failureAnnounced: true,
-  };
+function shorter(width: number | undefined, height: number | undefined): number | undefined {
+  if (width && height) return Math.min(width, height);
+  return height || width || undefined;
 }
