@@ -1,29 +1,27 @@
-import { AdaptiveController, TIER_ORDER, TIER_PROFILES, type QualityTier } from "../shared/adaptive";
+import { profileFor, START_TIER, TIER_ORDER, type QualityTier, type TierProfile } from "../shared/adaptive";
 import { RetryBudget } from "../shared/backoff";
-import { preferredAudioCodecs, preferredVideoCodecs, type CodecCap } from "../shared/codecs";
 import { sanitizeIceServers, type IceServer } from "../shared/ice-servers";
-import { IceBuffer } from "../shared/ice-buffer";
-import { encodeIcePayload, parseIcePayload, PROTOCOL_VERSION } from "../shared/protocol";
-import { shouldCreateOffer, shouldIgnoreOffer, type SignalingState } from "../shared/negotiation";
-import { summarizeStats, type StatCounters, type StatReport, type StatSummary } from "../shared/stats";
-import { encodeQualityMessage, parseQualityMessage, tierName } from "../shared/quality-label";
+import { isPeerId, PROTOCOL_VERSION, type KeptLink } from "../shared/protocol";
+import { tierName } from "../shared/quality-label";
 import { redactLogFields } from "../shared/redact";
 import { isResumeToken } from "../shared/ids";
+import { GROUP_CAPACITY, PAIR_CAPACITY } from "../shared/room-state";
+import type { StatSummary } from "../shared/stats";
 import { audioConstraints, type FacingMode, openCallMedia, videoConstraints } from "./open-media";
-import {
-  applyMediaIntent,
-  applyVideoTier,
-  freshMediaIntent,
-  tuneAudioSender,
-  toggleMediaIntent,
-  type AudioSenderControl,
-  type MediaIntent,
-  type SenderParameters,
-  type VideoSenderControl,
-  type VideoTrackControl,
-} from "./media-intent";
+import { applyMediaIntent, freshMediaIntent, toggleMediaIntent, type MediaIntent, type VideoTrackControl } from "./media-intent";
+import { PeerLink, type LinkHost, type LinkPhase, type TurnMode } from "./peer-link";
 
 export type CallPhase = "idle" | "starting" | "waiting" | "connecting" | "live" | "trouble" | "ended";
+
+/** One other person as the screen needs them: a picture, and how the connection to them is doing. */
+export interface RemotePeer {
+  id: string;
+  stream: MediaStream | null;
+  phase: LinkPhase;
+  note: string;
+  /** Their own outgoing link, when they reported it. */
+  tier: QualityTier | null;
+}
 
 export interface CallHooks {
   onStatus: (text: string) => void;
@@ -38,109 +36,66 @@ export interface CallHooks {
   /** This side's own outgoing leg, and the other person's when they report it over the data channel. */
   onQuality?: (tier: QualityTier, peerTier: QualityTier | null) => void;
   onCameras?: (count: number) => void;
+  /** Everyone else in the call, in the order they are shown. Called whenever one of them changes. */
+  onPeers?: (peers: RemotePeer[]) => void;
+  /** A picture or a voice arrived, or the page came back: whatever is on screen should be playing. */
+  onPlayback?: () => void;
+  /** How many people the room holds, as the room itself says. */
+  onCapacity?: (capacity: number) => void;
+}
+
+interface WelcomePeer {
+  peerId: string;
+  gen: number;
+  polite: boolean;
+  online: boolean;
 }
 
 interface WelcomeMessage {
   type: "welcome";
   peerId: string;
-  polite: boolean;
-  peerCount: number;
+  capacity?: number;
   resumed: boolean;
-  turnMode: "off" | "on" | "error";
+  turnMode: TurnMode;
   iceServers: IceServer[];
   resumeToken?: string;
   expiresAt: number;
-  gen?: number;
-  peerOnline?: boolean;
-}
-
-interface Recovery {
-  pc: RTCPeerConnection;
-  /** ICE restarts made, or confirmed by the offering side. */
-  restarts: number;
-  /** Restart requests in a row that got no ack. */
-  unacked: number;
-  awaitingAck: boolean;
-  rebuildAsked: boolean;
-  exhausted: boolean;
+  peers?: unknown;
 }
 
 const NO_RETRY = new Set([1000, 1008, 4000, 4002, 4004]);
 const PING_EVERY_MS = 20_000;
 const PONG_DEADLINE_MS = 10_000;
 const PROBE_DEADLINE_MS = 4_000;
-// A browser waits 15 to 30 seconds before it calls ICE failed. A restart after 8 usually connects at once,
-// because the second STUN round goes through a NAT or VPN path the first one has already opened.
-const CONNECT_WATCH_MS = 8_000;
-// One ICE restart is an offer, an answer, new candidates and connectivity checks. On a slow mobile link with a
-// relay that takes a few seconds. Ten leaves room for it without holding a dead call for long.
-const RESTART_WAIT_MS = 10_000;
-// The ack crosses the signaling server twice. Three seconds covers a one-second round trip with margin.
-// Longer silence means the request or the other side is lost.
-const ACK_WAIT_MS = 3_000;
-const MAX_UNACKED = 3;
-// After the answer to a restart arrives, connectivity checks on a working path finish within about a second.
-// A second trigger inside this window is the same failure seen by the other side, not a new one.
-const RESTART_SETTLE_MS = 2_000;
-// The room answers a rebuild request after fetching TURN credentials, which it bounds at four seconds.
-const REBUILD_WAIT_MS = 7_000;
-const ICE_RESTART_TRIES = 2;
-const MAX_REBUILDS = 4;
-const STATS_WARMUP_MS = 8_000;
-// Four missed reports in a row: the other side's tier is unknown again, not frozen at its last value.
-const PEER_QUALITY_STALE_MS = 9_000;
-// A little more buffer than the default smooths a jittery long-distance path without a delay people notice.
-const AUDIO_JITTER_TARGET_MS = 100;
-
 export class CallSession {
   private socket: WebSocket | null = null;
-  private pc: RTCPeerConnection | null = null;
   private localStream: MediaStream | null = null;
-  private remoteStream = new MediaStream();
-  private polite = false;
-  private peerCount = 0;
-  private offeringPc: RTCPeerConnection | null = null;
-  private iceBuffer = new IceBuffer();
+  /** One connection per other person, in the order they appeared. */
+  private links = new Map<string, PeerLink>();
+  private capacity: number;
+  private shownPhase: CallPhase = "idle";
+  private shownStatus = "";
   // About five minutes of attempts: long enough for a tunnel or a Wi-Fi to cellular handover.
   private signalRetry = new RetryBudget(40, 500, 8_000);
   private socketReady = false;
   private pongTimer = 0;
-  private recoverTimer = 0;
-  private recovery: Recovery | null = null;
-  private lastRestartAt = 0;
-  /** Generation of the current RTCPeerConnection. The room and the other side must name the same one. */
-  private pcGen = -1;
-  private peerOnline = false;
-  private rebuilds = 0;
-  private connectTimer = 0;
-  private connectedAt = 0;
   private networkChangedAt = 0;
   private switching = false;
   private restoring = false;
   private closed = false;
-  private iceRestart = false;
   private facing: FacingMode = "user";
-  private quality = new AdaptiveController();
-  private counters: StatCounters | undefined;
   private statsTimer = 0;
   private pingTimer = 0;
-  private disconnectedTimer = 0;
   private reconnectTimer = 0;
   private wakeLock: WakeLockSentinel | null = null;
-  private turnMode: WelcomeMessage["turnMode"] = "off";
-  private route = "неизвестно";
+  private turnMode: TurnMode = "off";
   private started = false;
   private epoch = 0;
   private intent: MediaIntent = freshMediaIntent();
   private heldVideo: VideoTrackControl | null = null;
-  private qualityChannel: RTCDataChannel | null = null;
-  private peerTier: QualityTier | null = null;
-  private peerTierAt = 0;
   private savedIce: IceServer[] = [];
   private listening = false;
   private previewJob: Promise<boolean> | null = null;
-  /** Which knob took the last tier. Shown in the diagnostics next to what the encoder really sends. */
-  private tierVia: "parameters" | "constraints" | "none" | null = null;
   private networkTarget: EventTarget | null = null;
   private readonly onVisibility = (): void => {
     if (document.visibilityState === "visible") void this.onForeground();
@@ -156,15 +111,37 @@ export class CallSession {
     if (this.started && !this.closed) this.finish("Звонок завершён", true);
   };
 
+  private readonly host: LinkHost = {
+    epoch: () => this.epoch,
+    alive: (epoch) => this.isCurrent(epoch),
+    socketReady: () => this.socketReady,
+    send: (message) => this.send(message),
+    reconnectSocket: () => this.reconnectSocket(),
+    localStream: () => this.localStream,
+    intent: () => this.intent,
+    turnMode: () => this.turnMode,
+    networkChangedAt: () => this.networkChangedAt,
+    profile: (tier) => this.profile(tier),
+    linkStatus: (link, text) => this.onLinkStatus(link, text),
+    linkPhase: (link) => this.onLinkPhase(link),
+    linkMedia: () => {
+      this.publishPeers();
+      this.hooks.onPlayback?.();
+    },
+    linkQuality: () => {
+      this.publishQuality();
+      this.publishPeers();
+    },
+  };
+
+  /** `group` is what the link says about the room. The room's own word arrives with the welcome. */
   constructor(
     private readonly roomId: string,
     private readonly localVideo: HTMLVideoElement,
-    private readonly remoteVideo: HTMLVideoElement,
     private readonly hooks: CallHooks,
+    group = false,
   ) {
-    // No stream is attached yet: an empty one given to a video before the page has loaded holds back its load event.
-    this.remoteVideo.playsInline = true;
-    this.remoteVideo.autoplay = true;
+    this.capacity = group ? GROUP_CAPACITY : PAIR_CAPACITY;
     this.localVideo.playsInline = true;
     this.localVideo.autoplay = true;
     this.localVideo.muted = true;
@@ -198,12 +175,8 @@ export class CallSession {
     this.started = true;
     this.closed = false;
     this.signalRetry.reset();
-    this.rebuilds = 0;
-    // A new call judges its own link. It does not start from the weak tier the last one ended on.
-    this.quality.reset();
-    this.remoteVideo.srcObject = this.remoteStream;
-    this.hooks.onPhase?.("starting");
-    this.hooks.onStatus("Включаем камеру и микрофон");
+    this.setPhase("starting");
+    this.setStatus("Включаем камеру и микрофон");
     // A lobby preview that is still opening is waited for, not raced with a second request for the camera.
     if (this.previewJob) await this.previewJob.catch(() => false);
     if (!this.isCurrent(epoch)) return;
@@ -221,14 +194,14 @@ export class CallSession {
       if (!media.ok) {
         this.started = false;
         this.hooks.onMediaIssue(media.reason);
-        this.hooks.onStatus(mediaIssueText(media.reason));
-        this.hooks.onPhase?.("idle");
+        this.setStatus(mediaIssueText(media.reason));
+        this.setPhase("idle");
         return;
       }
       this.hooks.onMediaIssue(null);
       this.adoptLocal(media.stream);
       void this.reportCameras();
-      if (!media.video) this.hooks.onStatus("Камера недоступна. Звонок со звуком.");
+      if (!media.video) this.setStatus("Камера недоступна. Звонок со звуком.");
     }
     this.attachLifecycle();
     await this.requestWake(epoch);
@@ -275,21 +248,18 @@ export class CallSession {
     return enabled;
   }
 
-  /** Starts a new connection on both sides. For the «Переподключить» button. */
+  /** Starts new connections to everyone who is not heard and seen. For the «Переподключить» button. */
   retry(): void {
     if (!this.isCurrent(this.epoch)) return;
-    this.rebuilds = 0;
-    this.stopRecovery();
     this.signalRetry.reset();
-    this.hooks.onPhase?.("connecting");
-    this.hooks.onStatus("Соединяем заново");
-    const pc = this.pc;
-    if (pc && this.socketReady && this.peerOnline) {
-      this.recovery = { pc, restarts: ICE_RESTART_TRIES, unacked: 0, awaitingAck: false, rebuildAsked: false, exhausted: false };
-      this.stepRecovery();
-    } else {
-      this.reconnectSocket();
+    this.setPhase("connecting");
+    this.setStatus("Соединяем заново");
+    let asked = this.links.size > 0;
+    for (const link of this.links.values()) {
+      if (!link.up() && !link.retry()) asked = false;
     }
+    // Without a socket, or without the other person's, the room has to be joined again first.
+    if (!asked) this.reconnectSocket();
   }
 
   async switchCamera(): Promise<void> {
@@ -325,24 +295,13 @@ export class CallSession {
       this.localVideo.srcObject = stream;
       this.markFacing(next);
       void this.localVideo.play().catch(() => undefined);
-      const sender = this.pc?.getSenders().find((item) => item.track === previous) ?? this.videoSender();
-      if (sender) await sender.replaceTrack(next);
-      else this.pc?.addTrack(next, stream);
+      for (const link of this.links.values()) await link.swapTrack(previous, next, stream);
       if (!this.isCurrent(epoch)) return;
-      await this.applyTier(this.quality.current(), epoch);
+      await this.applyTiers(epoch);
     } catch {
       if (this.isCurrent(epoch)) this.hooks.onStatus("Не удалось переключить камеру");
     } finally {
       this.switching = false;
-    }
-  }
-
-  async playRemote(): Promise<void> {
-    try {
-      await this.remoteVideo.play();
-      this.hooks.onAudioBlocked(false);
-    } catch {
-      this.hooks.onAudioBlocked(true);
     }
   }
 
@@ -360,10 +319,11 @@ export class CallSession {
         return;
       }
       const resume = readToken(this.resumeKey());
-      const hello: { type: "hello"; protocol: number; resume?: string; gen?: number } = { type: "hello", protocol: PROTOCOL_VERSION };
+      const hello: { type: "hello"; protocol: number; resume?: string; keep?: KeptLink[] } = { type: "hello", protocol: PROTOCOL_VERSION };
       if (resume && isResumeToken(resume)) hello.resume = resume;
-      // Naming the generation tells the room this side still holds its media connection and wants to keep it.
-      if (this.pc && this.pcGen >= 0) hello.gen = this.pcGen;
+      // Naming the generations tells the room which media connections this side still holds and wants to keep.
+      const keep = [...this.links.values()].filter((link) => link.hasConnection()).map((link) => ({ peerId: link.peerId, gen: link.gen }));
+      if (keep.length > 0) hello.keep = keep;
       socket.send(JSON.stringify(hello));
     });
     socket.addEventListener("message", (event) => {
@@ -377,7 +337,7 @@ export class CallSession {
       window.clearTimeout(this.pongTimer);
       this.pongTimer = 0;
       if (NO_RETRY.has(event.code)) {
-        this.finish(closeText(event.code, event.reason), false, event.code !== 4004 && event.reason !== "expired");
+        this.finish(closeText(event.code, event.reason, this.capacity), false, event.code !== 4004 && event.reason !== "expired");
         return;
       }
       const delay = this.signalRetry.next();
@@ -387,9 +347,9 @@ export class CallSession {
       }
       const epoch = this.epoch;
       // Sound and picture go browser to browser. They survive a signaling drop until the room rebuilds the call.
-      if (!this.pc || !iceUp(this.pc)) {
-        this.hooks.onPhase?.("trouble");
-        this.hooks.onStatus("Связь с комнатой прервалась. Пробуем снова.");
+      if (!this.anyUp()) {
+        this.setPhase("trouble");
+        this.setStatus("Связь с комнатой прервалась. Пробуем снова.");
       }
       this.reconnectTimer = window.setTimeout(() => {
         this.reconnectTimer = 0;
@@ -448,50 +408,54 @@ export class CallSession {
       this.pongTimer = 0;
       return;
     }
+    const peerId = isPeerId(message.peerId) ? message.peerId : isPeerId(message.from) ? message.from : null;
+    if (!peerId) return;
     if (message.type === "peer-left") {
-      this.peerCount = typeof message.peerCount === "number" ? message.peerCount : 1;
-      this.peerOnline = false;
+      const link = this.links.get(peerId);
+      if (!link) return;
+      link.online = false;
       if (message.gone === false) {
-        // Only the other side's signaling is away. Sound and picture go directly and may be perfectly fine.
-        this.pauseRecovery();
-        if (this.pc && !iceUp(this.pc)) this.hooks.onStatus("У собеседника пропала связь. Ждём его возвращения.");
+        // Only that person's signaling is away. Sound and picture go directly and may be perfectly fine.
+        link.pauseRecovery();
+        if (link.hasConnection() && !link.up()) link.setStatus("У собеседника пропала связь. Ждём его возвращения.");
         return;
       }
-      this.dropConnection();
-      this.clearRemote();
-      this.hooks.onWaiting(true);
-      this.hooks.onStatus("Собеседник вышел. Ждём возвращения.");
-      this.hooks.onPhase?.("waiting");
+      this.removeLink(link);
+      if (this.links.size > 0) return;
+      this.announceWaiting();
+      this.setStatus(this.capacity > PAIR_CAPACITY ? "Все вышли. Ждём возвращения." : "Собеседник вышел. Ждём возвращения.");
+      this.setPhase("waiting");
       return;
     }
     if (message.type === "peer-joined" || message.type === "peer-back" || message.type === "rebuild") {
       const gen = generationOf(message.gen);
       if (gen === null) return;
-      this.peerCount = typeof message.peerCount === "number" ? message.peerCount : 2;
-      if (message.type !== "rebuild") this.peerOnline = true;
+      // A rebuild is about a connection that exists. Only a peer the room announces gets a new one.
+      const link = message.type === "rebuild" ? this.links.get(peerId) : this.linkTo(peerId, message.polite === true);
+      if (!link) return;
+      if (message.type !== "rebuild") {
+        link.polite = message.polite === true;
+        link.online = true;
+      }
       this.adoptIce(message);
-      if (this.pc && this.pcGen === gen) {
+      if (link.holds(gen)) {
         // Same generation: the other side kept its connection and so does this one.
-        this.resumeLink();
+        link.resume();
         return;
       }
-      this.buildConnection(gen, this.savedIce);
-      this.hooks.onWaiting(false);
-      this.hooks.onStatus(message.type === "peer-joined" ? "Соединяем" : "Соединяем заново");
-      this.hooks.onPhase?.("connecting");
-      await this.negotiate();
+      await this.connect(link, gen, message.type === "peer-joined" ? "Соединяем" : "Соединяем заново");
       return;
     }
+    const link = this.links.get(peerId);
+    if (!link) return;
     if (message.type === "restart") {
-      if (!this.pc || message.gen !== this.pcGen) return;
-      if (message.ack === true) this.onRestartAck();
-      else this.onRestartRequest();
+      const gen = generationOf(message.gen);
+      if (gen !== null) link.onRestart(gen, message.ack === true);
       return;
     }
     if (message.type === "signal" && typeof message.payload === "string" && (message.kind === "offer" || message.kind === "answer" || message.kind === "ice")) {
-      // SDP and candidates of another generation belong to a connection that no longer exists here.
-      if (!this.pc || message.gen !== this.pcGen) return;
-      await this.applySignal(message.kind, message.payload);
+      const gen = generationOf(message.gen);
+      if (gen !== null) await link.onSignal(message.kind, message.payload, gen);
     }
   }
 
@@ -505,464 +469,137 @@ export class CallSession {
     if (!this.isCurrent(epoch)) return;
     this.signalRetry.reset();
     this.socketReady = true;
-    this.polite = welcome.polite;
-    this.peerCount = welcome.peerCount;
-    this.peerOnline = welcome.peerOnline === true;
     this.turnMode = welcome.turnMode;
     this.savedIce = welcome.iceServers;
     if (welcome.resumeToken && isResumeToken(welcome.resumeToken)) writeToken(this.resumeKey(), welcome.resumeToken);
-    const gen = generationOf(welcome.gen) ?? 0;
-    if (welcome.peerCount < 2) {
-      // Alone in the room. A connection is built when the other person arrives, with fresh ICE servers.
-      this.dropConnection();
-      this.clearRemote();
-      this.hooks.onWaiting(true);
-      this.hooks.onPhase?.("waiting");
-    } else if (this.pc && this.pcGen === gen) {
-      // Only the signaling socket was replaced. The media connection of this generation goes on untouched.
-      this.resumeLink();
+    if (typeof welcome.capacity === "number" && welcome.capacity >= PAIR_CAPACITY) {
+      this.capacity = welcome.capacity;
+      this.hooks.onCapacity?.(welcome.capacity);
+    }
+    const peers = welcomePeers(welcome.peers);
+    // Whoever the room no longer lists left while this side was away.
+    for (const link of [...this.links.values()]) {
+      if (!peers.some((peer) => peer.peerId === link.peerId)) this.removeLink(link);
+    }
+    if (peers.length === 0) {
+      // Alone in the room. A connection is built when someone arrives, with fresh ICE servers.
+      this.announceWaiting();
+      this.setPhase("waiting");
     } else {
-      this.buildConnection(gen, welcome.iceServers);
-      this.hooks.onWaiting(false);
-      this.hooks.onPhase?.("connecting");
-      await this.negotiate();
+      await Promise.all(
+        peers.map(async (peer) => {
+          const link = this.linkTo(peer.peerId, peer.polite);
+          link.polite = peer.polite;
+          link.online = peer.online;
+          // Only the signaling socket was replaced. The media connection of this generation goes on untouched.
+          if (link.holds(peer.gen)) link.resume();
+          else await this.connect(link, peer.gen, "Соединяем");
+        }),
+      );
     }
     if (!this.isCurrent(epoch)) return;
     this.publishDiagnostics();
     this.startStats();
   }
 
-  /** Signaling is back for a connection that was kept. Recovery continues only if the media path needs it. */
-  private resumeLink(): void {
-    const pc = this.pc;
-    if (!pc) return;
-    if (iceUp(pc)) {
-      this.hooks.onStatus(this.linkStatus());
-      this.hooks.onPhase?.("live");
-      return;
-    }
-    if (this.recovery?.pc === pc) {
-      if (!this.recovery.exhausted) this.stepRecovery();
-    } else {
-      this.beginRecovery();
-    }
+  /** Builds the connection of this generation to one person and starts agreeing on it. */
+  private async connect(link: PeerLink, gen: number, text: string): Promise<void> {
+    link.build(gen, this.savedIce);
+    link.setStatus(text);
+    link.setPhase("connecting");
+    await link.negotiate();
   }
 
-  private buildConnection(gen: number, iceServers: IceServer[]): void {
-    this.dropConnection();
-    const pc = new RTCPeerConnection({ iceServers: sanitizeIceServers(iceServers) });
-    this.pc = pc;
-    this.pcGen = gen;
-    // The last picture of the previous connection stays on screen, dimmed by the phase, until the new one delivers.
-    const incoming = new MediaStream();
-    this.remoteStream = incoming;
-    for (const track of this.localStream?.getTracks() ?? []) pc.addTrack(track, this.localStream!);
-    this.preferCodecs(pc);
-    this.openQualityChannel(pc);
-    pc.addEventListener("icecandidate", (event) => {
-      if (!event.candidate || this.pc !== pc) return;
-      this.sendSignal(
-        "ice",
-        encodeIcePayload({
-          candidate: event.candidate.candidate,
-          sdpMid: event.candidate.sdpMid,
-          sdpMLineIndex: event.candidate.sdpMLineIndex,
-        }),
-        gen,
-      );
-    });
-    pc.addEventListener("track", (event) => {
-      if (this.pc !== pc) return;
-      // The stream the other side sent keeps sound and picture on one clock. A hand-built one is the fallback.
-      const stream = event.streams[0] ?? incoming;
-      if (stream === incoming && !incoming.getTracks().includes(event.track)) incoming.addTrack(event.track);
-      this.remoteStream = stream;
-      if (this.remoteVideo.srcObject !== stream) this.remoteVideo.srcObject = stream;
-      if (event.track.kind === "audio") cushionAudio(event.receiver);
-      void this.playRemote();
-    });
-    pc.addEventListener("iceconnectionstatechange", () => {
-      if (this.pc !== pc) return;
-      this.onIceState(pc.iceConnectionState);
-    });
-    pc.addEventListener("connectionstatechange", () => {
-      if (this.pc !== pc) return;
-      // Safari reports a broken DTLS session here while ICE still looks connected. An ICE restart cannot fix that.
-      if (pc.connectionState !== "failed") return;
-      if (iceUp(pc)) {
-        this.stopRecovery();
-        this.recovery = { pc, restarts: ICE_RESTART_TRIES, unacked: 0, awaitingAck: false, rebuildAsked: false, exhausted: false };
-        this.stepRecovery();
-      } else {
-        this.onIceState("failed");
-      }
-    });
+  private linkTo(peerId: string, polite: boolean): PeerLink {
+    const known = this.links.get(peerId);
+    if (known) return known;
+    const link = new PeerLink(peerId, polite, this.host);
+    this.links.set(peerId, link);
+    // One more person to send to: every outgoing video gets a smaller share of the uplink.
+    void this.applyTiers(this.epoch);
+    return link;
   }
 
-  /** Closes the connection and everything that belongs to it: timers, buffered candidates, counters. */
-  private dropConnection(): void {
-    const previous = this.pc;
-    this.pc = null;
-    this.pcGen = -1;
-    previous?.close();
-    this.stopRecovery();
-    window.clearTimeout(this.disconnectedTimer);
-    window.clearTimeout(this.connectTimer);
-    this.connectedAt = 0;
-    // Byte and packet counters start from zero on a new connection. A difference against old ones is meaningless.
-    this.counters = undefined;
-    this.iceRestart = false;
-    this.lastRestartAt = 0;
-    this.iceBuffer.reset();
-    this.qualityChannel = null;
-    this.peerTier = null;
+  private removeLink(link: PeerLink): void {
+    link.close();
+    this.links.delete(link.peerId);
+    this.publishPeers();
+    const [only, ...rest] = [...this.links.values()];
+    if (only && rest.length === 0) {
+      // Back to two people: the screen says what that one connection says.
+      this.setStatus(only.note);
+      this.setPhase(only.phase);
+    } else if (only) {
+      this.syncGroup();
+    }
+    void this.applyTiers(this.epoch);
+    this.publishQuality();
+  }
+
+  private onLinkStatus(link: PeerLink, text: string): void {
+    if (this.links.size <= 1) this.setStatus(text);
+    else this.syncGroup();
+    if (this.links.has(link.peerId)) this.publishPeers();
+  }
+
+  private onLinkPhase(link: PeerLink): void {
+    if (this.links.size <= 1) this.setPhase(link.phase);
+    else this.syncGroup();
+    if (this.links.has(link.peerId)) this.publishPeers();
   }
 
   /**
-   * A channel both sides open with the same id, so it needs no signaling of its own. It carries one thing:
-   * the name of this side's quality tier. If it never opens, the other person's tier simply stays unknown.
+   * With several people the screen follows the call as a whole: it is live while anyone is heard, and
+   * each person's own trouble is shown on their picture. Only a real change reaches the screen.
    */
-  private openQualityChannel(pc: RTCPeerConnection): void {
-    try {
-      const channel = pc.createDataChannel("quality", { negotiated: true, id: 0 });
-      this.qualityChannel = channel;
-      channel.addEventListener("message", (event) => {
-        if (this.pc !== pc) return;
-        const tier = parseQualityMessage(event.data);
-        if (!tier) return;
-        this.peerTierAt = Date.now();
-        if (tier === this.peerTier) return;
-        this.peerTier = tier;
-        this.publishQuality();
-      });
-      channel.addEventListener("open", () => {
-        if (this.pc === pc) this.sendQuality();
-      });
-    } catch {
-      this.qualityChannel = null;
-    }
+  private syncGroup(): void {
+    const links = [...this.links.values()];
+    const phase: LinkPhase = links.some((link) => link.phase === "live") ? "live" : links.some((link) => link.phase === "trouble") ? "trouble" : "connecting";
+    const text = phase === "live" ? "" : (links.find((link) => link.phase === phase)?.note ?? "");
+    if (text !== this.shownStatus) this.setStatus(text);
+    if (phase !== this.shownPhase) this.setPhase(phase);
   }
 
-  private sendQuality(): void {
-    const channel = this.qualityChannel;
-    if (!channel || channel.readyState !== "open") return;
-    try {
-      channel.send(encodeQualityMessage(this.quality.current()));
-    } catch {
-      // The picture and the sound do not depend on this channel.
-    }
+  /** Alone in the room. The screen words this itself, for two people or for a conference. */
+  private announceWaiting(): void {
+    this.shownStatus = "waiting";
+    this.hooks.onWaiting(true);
   }
 
+  private setStatus(text: string): void {
+    this.shownStatus = text;
+    this.hooks.onStatus(text);
+  }
+
+  private setPhase(phase: CallPhase): void {
+    this.shownPhase = phase;
+    this.hooks.onPhase?.(phase);
+  }
+
+  private publishPeers(): void {
+    this.hooks.onPeers?.(
+      [...this.links.values()].map((link) => ({ id: link.peerId, stream: link.remoteStream, phase: link.phase, note: link.note, tier: link.peerTier })),
+    );
+  }
+
+  private anyUp(): boolean {
+    return [...this.links.values()].some((link) => link.up());
+  }
+
+  /** The limits of a tier in this call: lower when the uplink is shared between several people. */
+  private profile(tier: QualityTier): TierProfile {
+    return profileFor(tier, this.links.size);
+  }
+
+  private async applyTiers(epoch: number): Promise<void> {
+    await Promise.all([...this.links.values()].map((link) => link.applyTier(epoch)));
+  }
+
+  /** The weakest of this side's outgoing links, and the other person's own when there is exactly one. */
   private publishQuality(): void {
-    if (this.peerTier && Date.now() - this.peerTierAt > PEER_QUALITY_STALE_MS) this.peerTier = null;
-    this.hooks.onQuality?.(this.quality.current(), this.peerTier);
-  }
-
-  /** Voice first: a modest cap and high priority on the audio sender. The adaptation itself never touches audio. */
-  private tuneAudio(pc: RTCPeerConnection): void {
-    const sender = pc.getSenders().find((item) => item.track?.kind === "audio");
-    if (sender) void tuneAudioSender(asAudioSender(sender));
-  }
-
-  private clearRemote(): void {
-    this.remoteStream = new MediaStream();
-    this.remoteVideo.srcObject = this.remoteStream;
-  }
-
-  private preferCodecs(pc: RTCPeerConnection): void {
-    const video = rtcCapabilities("video");
-    const audio = rtcCapabilities("audio");
-    for (const transceiver of pc.getTransceivers()) {
-      const kind = transceiver.sender.track?.kind ?? transceiver.receiver.track?.kind;
-      try {
-        if (kind === "video" && video.length > 0) transceiver.setCodecPreferences?.(video as RTCRtpCodec[]);
-        if (kind === "audio" && audio.length > 0) transceiver.setCodecPreferences?.(audio as RTCRtpCodec[]);
-      } catch {
-        // Safari can reject a preference list. The browser then keeps its own order.
-      }
-    }
-  }
-
-  private async negotiate(): Promise<void> {
-    const pc = this.pc;
-    const gen = this.pcGen;
-    const epoch = this.epoch;
-    if (!this.isCurrent(epoch) || !pc || this.peerCount < 2 || this.offeringPc === pc || pc.signalingState !== "stable") return;
-    if (!shouldCreateOffer({ polite: this.polite })) {
-      // Only the other side offers. If its offer never comes, the watchdog asks for one.
-      this.armConnectWatch(pc);
-      return;
-    }
-    this.offeringPc = pc;
-    try {
-      const offer = await pc.createOffer({ iceRestart: this.iceRestart });
-      this.iceRestart = false;
-      if (!this.isCurrent(epoch) || this.pc !== pc || pc.signalingState !== "stable") return;
-      await pc.setLocalDescription(offer);
-      const sdp = pc.localDescription?.sdp;
-      if (this.isCurrent(epoch) && this.pc === pc && sdp) {
-        this.sendSignal("offer", sdp, gen);
-        if (!iceUp(pc)) this.armConnectWatch(pc);
-      }
-    } catch {
-      if (this.pc === pc && !iceUp(pc)) this.armConnectWatch(pc);
-    } finally {
-      if (this.offeringPc === pc) this.offeringPc = null;
-    }
-  }
-
-  private async restartIce(pc: RTCPeerConnection): Promise<void> {
-    if (this.pc !== pc || this.polite || this.offeringPc === pc) return;
-    this.lastRestartAt = Date.now();
-    if (pc.signalingState === "have-local-offer") {
-      // The answer to the last offer never came. Without a rollback no new offer can be made.
-      try {
-        await pc.setLocalDescription({ type: "rollback" });
-      } catch {
-        return;
-      }
-    }
-    if (this.pc !== pc) return;
-    this.iceRestart = true;
-    await this.negotiate();
-  }
-
-  /** If the call has not connected in time, recovery takes over instead of waiting forever on «Соединяем». */
-  private armConnectWatch(pc: RTCPeerConnection): void {
-    window.clearTimeout(this.connectTimer);
-    const epoch = this.epoch;
-    this.connectTimer = window.setTimeout(() => {
-      if (!this.isCurrent(epoch) || this.pc !== pc || iceUp(pc)) return;
-      this.beginRecovery();
-    }, CONNECT_WATCH_MS);
-  }
-
-  /** One recovery procedure per connection. A second trigger while it runs changes nothing. */
-  private beginRecovery(): void {
-    const pc = this.pc;
-    if (!this.isCurrent(this.epoch) || !pc || this.peerCount < 2 || this.recovery?.pc === pc) return;
-    window.clearTimeout(this.recoverTimer);
-    this.recovery = { pc, restarts: 0, unacked: 0, awaitingAck: false, rebuildAsked: false, exhausted: false };
-    this.stepRecovery();
-  }
-
-  /**
-   * Signaling first, then ICE restarts on the same connection, then a new connection as the last step.
-   * The offering side restarts by itself. The other side asks it to, and waits for an ack instead of guessing.
-   */
-  private stepRecovery(): void {
-    window.clearTimeout(this.recoverTimer);
-    this.recoverTimer = 0;
-    const run = this.recovery;
-    const pc = this.pc;
-    const epoch = this.epoch;
-    if (!run || !pc || run.pc !== pc || !this.isCurrent(epoch) || this.peerCount < 2) {
-      this.recovery = null;
-      return;
-    }
-    if (iceUp(pc) && pc.connectionState !== "failed") {
-      this.recovery = null;
-      return;
-    }
-    this.hooks.onPhase?.("trouble");
-    // Nothing can be agreed while a socket is away. The welcome or the peer's return continues from this step.
-    if (!this.socketReady) {
-      this.hooks.onStatus("Связь с комнатой прервалась. Пробуем снова.");
-      return;
-    }
-    if (!this.peerOnline) {
-      this.hooks.onStatus("У собеседника пропала связь. Ждём его возвращения.");
-      return;
-    }
-    const again = (delay: number): void => {
-      this.recoverTimer = window.setTimeout(() => {
-        if (this.isCurrent(epoch)) this.stepRecovery();
-      }, delay);
-    };
-    if (run.rebuildAsked) {
-      // The room did not answer the rebuild request, so the socket is suspect. A new one continues from here.
-      run.rebuildAsked = false;
-      this.reconnectSocket();
-      return;
-    }
-    if (run.restarts < ICE_RESTART_TRIES && run.unacked < MAX_UNACKED) {
-      this.hooks.onStatus("Связь пропала. Восстанавливаем.");
-      if (this.polite) {
-        run.unacked += 1;
-        run.awaitingAck = true;
-        this.send({ type: "restart", gen: this.pcGen, ack: false });
-        again(ACK_WAIT_MS);
-      } else {
-        run.restarts += 1;
-        // A restart the other side has just asked for already covers this step.
-        if (!this.restartInFlight(pc)) void this.restartIce(pc);
-        again(RESTART_WAIT_MS);
-      }
-      return;
-    }
-    if (this.rebuilds >= MAX_REBUILDS) {
-      run.exhausted = true;
-      this.hooks.onStatus(
-        this.turnMode === "on"
-          ? "Связь не восстанавливается. Проверьте интернет."
-          : "Через эту сеть звонок не проходит. Попробуйте другую.",
-      );
-      return;
-    }
-    this.rebuilds += 1;
-    run.rebuildAsked = true;
-    this.hooks.onStatus("Соединяем заново");
-    // Both sides may ask at once. They name the same generation, so the room starts exactly one new one.
-    this.send({ type: "rebuild", gen: this.pcGen });
-    again(REBUILD_WAIT_MS);
-  }
-
-  /** The offering side confirmed the request. Now the restart itself gets its time. */
-  private onRestartAck(): void {
-    const run = this.recovery;
-    if (!run || run.pc !== this.pc || !run.awaitingAck) return;
-    run.awaitingAck = false;
-    run.unacked = 0;
-    run.restarts += 1;
-    const epoch = this.epoch;
-    window.clearTimeout(this.recoverTimer);
-    this.recoverTimer = window.setTimeout(() => {
-      if (this.isCurrent(epoch)) this.stepRecovery();
-    }, RESTART_WAIT_MS);
-  }
-
-  /** The other side lost the media path. This side may see nothing wrong and restarts ICE anyway. */
-  private onRestartRequest(): void {
-    const pc = this.pc;
-    if (!pc || this.polite) return;
-    this.send({ type: "restart", gen: this.pcGen, ack: true });
-    if (this.restartInFlight(pc)) return;
-    void this.restartIce(pc);
-  }
-
-  /** True while an ICE restart is being negotiated or has only just been answered. */
-  private restartInFlight(pc: RTCPeerConnection): boolean {
-    if (this.offeringPc === pc || pc.signalingState === "have-local-offer") return this.lastRestartAt > 0;
-    return this.lastRestartAt > 0 && Date.now() - this.lastRestartAt < RESTART_SETTLE_MS;
-  }
-
-  private pauseRecovery(): void {
-    window.clearTimeout(this.recoverTimer);
-    this.recoverTimer = 0;
-    if (this.recovery) {
-      this.recovery.awaitingAck = false;
-      this.recovery.rebuildAsked = false;
-    }
-  }
-
-  private stopRecovery(): void {
-    window.clearTimeout(this.recoverTimer);
-    this.recoverTimer = 0;
-    this.recovery = null;
-  }
-
-  private async applySignal(kind: "offer" | "answer" | "ice", payload: string): Promise<void> {
-    if (kind === "ice") await this.onRemoteIce(payload);
-    else await this.onRemoteDescription(kind, payload);
-  }
-
-  private async onRemoteDescription(kind: "offer" | "answer", sdp: string): Promise<void> {
-    const pc = this.pc;
-    const gen = this.pcGen;
-    if (!pc || !sdp.startsWith("v=")) return;
-    // An answer to an offer that was rolled back or belongs to a replaced connection.
-    if (kind === "answer" && pc.signalingState !== "have-local-offer") return;
-    const ignore = shouldIgnoreOffer({
-      polite: this.polite,
-      makingOffer: this.offeringPc === pc,
-      signalingState: pc.signalingState as SignalingState,
-      descriptionType: kind,
-    });
-    if (ignore) return;
-    if (kind === "offer" && (this.offeringPc === pc || pc.signalingState !== "stable")) {
-      try {
-        await pc.setLocalDescription({ type: "rollback" });
-      } catch {
-        return;
-      }
-    }
-    const current = this.pc;
-    if (!current) return;
-    try {
-      await current.setRemoteDescription({ type: kind, sdp });
-      if (this.pc !== current) return;
-      for (const payload of this.iceBuffer.markReady()) await this.addIce(payload);
-      if (kind === "offer") {
-        const answer = await current.createAnswer();
-        if (this.pc !== current) return;
-        await current.setLocalDescription(answer);
-        if (this.pc === current && current.localDescription?.sdp) {
-          this.sendSignal("answer", current.localDescription.sdp, gen);
-          if (!iceUp(current)) this.armConnectWatch(current);
-        }
-      }
-    } catch {
-      // The watchdog and the recovery steps retry. A status here would only alarm the person on the call.
-      if (this.pc === current && !iceUp(current)) this.armConnectWatch(current);
-    }
-  }
-
-  private async onRemoteIce(payload: string): Promise<void> {
-    for (const item of this.iceBuffer.push(payload)) await this.addIce(item);
-  }
-
-  private async addIce(payload: string): Promise<void> {
-    const parsed = parseIcePayload(payload);
-    const pc = this.pc;
-    if (!parsed || !pc) return;
-    try {
-      await pc.addIceCandidate({ candidate: parsed.candidate, sdpMid: parsed.sdpMid, sdpMLineIndex: parsed.sdpMLineIndex });
-    } catch {
-      // One rejected candidate is not a failure. Others still connect the call.
-    }
-  }
-
-  private onIceState(state: RTCIceConnectionState): void {
-    window.clearTimeout(this.disconnectedTimer);
-    this.remoteVideo.dataset.ice = state;
-    const epoch = this.epoch;
-    if (state === "connected" || state === "completed") {
-      window.clearTimeout(this.connectTimer);
-      this.stopRecovery();
-      this.rebuilds = 0;
-      // That restart is finished. A request that comes now is about a new failure.
-      this.lastRestartAt = 0;
-      this.hooks.onWaiting(false);
-      this.hooks.onStatus(this.linkStatus());
-      this.hooks.onPhase?.("live");
-      if (!this.connectedAt) {
-        this.connectedAt = Date.now();
-        // A rebuilt connection starts with default encodings. The current ceiling is applied again.
-        void this.applyTier(this.quality.current(), epoch);
-        if (this.pc) this.tuneAudio(this.pc);
-      }
-      this.publishQuality();
-      return;
-    }
-    // A running recovery owns the status line: it may be waiting for the room or for the other person.
-    const announce = this.recovery?.pc !== this.pc;
-    if (state === "failed") {
-      this.hooks.onPhase?.("trouble");
-      if (announce) this.hooks.onStatus("Связь пропала. Восстанавливаем.");
-      this.beginRecovery();
-      return;
-    }
-    if (state === "disconnected") {
-      this.hooks.onPhase?.("trouble");
-      if (announce) this.hooks.onStatus("Связь пропала. Восстанавливаем.");
-      // Right after a network change there is nothing to wait for.
-      const wait = Date.now() - this.networkChangedAt < 10_000 ? 500 : 3_000;
-      this.disconnectedTimer = window.setTimeout(() => {
-        if (!this.isCurrent(epoch)) return;
-        const now = this.pc?.iceConnectionState;
-        if (now === "disconnected" || now === "failed") this.beginRecovery();
-      }, wait);
-    }
+    const links = [...this.links.values()];
+    const only = links.length === 1 ? links[0] : undefined;
+    this.hooks.onQuality?.(worstTier(links.map((link) => link.quality.current())) ?? START_TIER, only?.peerTier ?? null);
   }
 
   private onNetworkChange(): void {
@@ -975,12 +612,7 @@ export class CallSession {
     } else {
       this.ping(PROBE_DEADLINE_MS);
     }
-    const pc = this.pc;
-    if (pc && this.peerCount >= 2 && (pc.iceConnectionState === "disconnected" || pc.iceConnectionState === "failed")) this.beginRecovery();
-  }
-
-  private sendSignal(kind: "offer" | "answer" | "ice", payload: string, gen: number): void {
-    this.send({ type: "signal", kind, payload, gen });
+    for (const link of this.links.values()) link.networkChanged();
   }
 
   private send(message: object): void {
@@ -997,59 +629,23 @@ export class CallSession {
 
   private async sampleStats(): Promise<void> {
     const epoch = this.epoch;
-    const pc = this.pc;
-    if (!this.isCurrent(epoch) || !pc) return;
-    let reports: StatReport[] = [];
-    try {
-      const stats = await pc.getStats();
-      stats.forEach((report) => {
-        reports.push(report as unknown as StatReport);
-      });
-    } catch {
-      reports = [];
-    }
-    const summary = summarizeStats(reports, this.counters, Date.now());
-    this.counters = summary.counters;
-    this.route = summary.route === "direct" ? "прямое" : summary.route === "relay" ? "релей" : "неизвестно";
-    if (!this.isCurrent(epoch) || this.pc !== pc) return;
-    // The bandwidth estimate starts low and climbs for a few seconds. Judging it then lowers quality for no reason.
-    if (!this.connectedAt || Date.now() - this.connectedAt < STATS_WARMUP_MS) {
-      this.publishDiagnostics(summary);
-      return;
-    }
-    const before = this.quality.current();
-    const decision = this.quality.observe({
-      atMs: Date.now(),
-      rttMs: summary.rttMs,
-      lossRatio: summary.lossRatio,
-      inboundLossRatio: summary.inboundLossRatio,
-      jitterMs: summary.jitterMs,
-      availableOutgoingBitrate: summary.availableOutgoingBitrate,
-      framesDroppedRatio: summary.framesDroppedRatio,
-      encoderLimit: summary.encoderLimit,
-    });
-    if (decision.changed) {
-      await this.applyTier(decision.tier, epoch);
-      if (!this.isCurrent(epoch)) return;
-      // A fresh key frame lets the cheaper picture appear at once instead of smearing in.
-      if (TIER_ORDER.indexOf(decision.tier) < TIER_ORDER.indexOf(before)) requestKeyFrame(this.videoSender());
-    }
-    this.sendQuality();
+    if (!this.isCurrent(epoch) || this.links.size === 0) return;
+    await Promise.all([...this.links.values()].map((link) => link.sample()));
+    if (!this.isCurrent(epoch)) return;
     this.publishQuality();
-    this.publishDiagnostics(summary);
+    this.publishPeers();
+    this.publishDiagnostics();
   }
 
-  /** Limits outgoing video to the tier. It never stops the video: that is the camera button's job alone. */
-  private async applyTier(tier: QualityTier, epoch: number): Promise<void> {
-    const sender = this.videoSender();
-    if (!sender || !this.isCurrent(epoch)) return;
-    const result = await applyVideoTier(asVideoSender(sender), tier, this.intent);
-    if (this.isCurrent(epoch)) this.tierVia = result.via;
-  }
-
-  private publishDiagnostics(summary?: StatSummary): void {
-    const tier = this.quality.current();
-    const score = this.quality.score();
+  /** The numbers of one connection. With several people it is the one that is doing worst. */
+  private publishDiagnostics(): void {
+    const links = [...this.links.values()];
+    const worst = worstTier(links.map((item) => item.quality.current()));
+    const link = links.find((item) => item.quality.current() === worst);
+    const summary: StatSummary | undefined = link?.summary;
+    const tier = link?.quality.current() ?? START_TIER;
+    const score = link?.quality.score() ?? null;
+    const tierVia = link?.tierVia ?? null;
     const percent = (value: number | undefined): string => (value === undefined ? "неизвестно" : `${Math.round(value * 1000) / 10}%`);
     const ms = (value: number | undefined): string => (value === undefined ? "неизвестно" : `${value} мс`);
     const kbit = (value: number | undefined): string => (value === undefined ? "неизвестно" : `${Math.round(value / 1000)} кбит/с`);
@@ -1058,14 +654,14 @@ export class CallSession {
       `Задержка: ${ms(summary?.rttMs)}`,
       `Потери: ${percent(summary?.lossRatio)}`,
       // What the encoder really sends against the tier's ceiling: the only proof that the limit took hold.
-      `Кадры: ${summary?.framesPerSecond === undefined ? "неизвестно" : `${Math.round(summary.framesPerSecond)} из ${TIER_PROFILES[tier].maxFramerate}`}`,
+      `Кадры: ${summary?.framesPerSecond === undefined ? "неизвестно" : `${Math.round(summary.framesPerSecond)} из ${this.profile(tier).maxFramerate}`}`,
       `Размер: ${summary?.width && summary?.height ? `${summary.width}×${summary.height}` : "неизвестно"}`,
     ];
     const more = [
       `Оценка связи: ${score === null ? "неизвестно" : `${score} из 100`}`,
-      `Ограничение видео: ${this.tierVia === "parameters" ? "параметры отправителя" : this.tierVia === "constraints" ? "настройки камеры" : this.tierVia === "none" ? "не применилось" : "неизвестно"}`,
-      `У собеседника: ${this.peerTier ? tierName(this.peerTier) : "неизвестно"}`,
-      `Маршрут: ${this.route}`,
+      `Ограничение видео: ${tierVia === "parameters" ? "параметры отправителя" : tierVia === "constraints" ? "настройки камеры" : tierVia === "none" ? "не применилось" : "неизвестно"}`,
+      `У собеседника: ${link?.peerTier ? tierName(link.peerTier) : "неизвестно"}`,
+      `Маршрут: ${link?.route ?? "неизвестно"}`,
       `Релей: ${this.turnMode === "on" ? "включён" : this.turnMode === "error" ? "не ответил, только прямое" : "выключен"}`,
       `Потери на приёме: ${percent(summary?.inboundLossRatio)}`,
       `Джиттер: ${ms(summary?.jitterMs)}`,
@@ -1075,10 +671,12 @@ export class CallSession {
       `Пропущенные кадры: ${percent(summary?.framesDroppedRatio)}`,
       `Восполнение звука: ${percent(summary?.concealmentRatio)}`,
     ];
+    // In a conference the lines above are about one connection out of several. Say so, and say how many.
+    if (links.length > 1) more.unshift(`В звонке: ${links.length + 1} из ${this.capacity}`, "Показано: самое слабое соединение");
     this.hooks.onDiagnostics(main, more);
     if (debugEnabled()) {
       // Numbers and tier names only. The same filter as the server logs drops anything that could carry SDP, ICE or a token.
-      console.debug("wirecall", redactLogFields({ tier, score, peerTier: this.peerTier, route: this.route, ...numbersOf(summary) }));
+      console.debug("wirecall", redactLogFields({ tier, score, peerTier: link?.peerTier ?? null, route: link?.route, links: links.length, ...numbersOf(summary) }));
     }
   }
 
@@ -1089,8 +687,7 @@ export class CallSession {
     this.onNetworkChange();
     await this.requestWake(epoch);
     if (!this.isCurrent(epoch)) return;
-    await this.playRemote();
-    if (!this.isCurrent(epoch)) return;
+    this.hooks.onPlayback?.();
     await this.restoreTracks();
   }
 
@@ -1119,9 +716,7 @@ export class CallSession {
         if (previous) stream.removeTrack(previous);
         stream.addTrack(track);
         if (track.kind === "video") this.heldVideo = track;
-        const sender = this.pc?.getSenders().find((item) => item.track === previous || (item.track === null && track.kind === "video"));
-        if (sender) await sender.replaceTrack(track);
-        else this.pc?.addTrack(track, stream);
+        for (const link of this.links.values()) await link.swapTrack(previous, track, stream);
         if (!this.isCurrent(epoch)) {
           track.stop();
           return;
@@ -1129,7 +724,7 @@ export class CallSession {
       }
       this.localVideo.srcObject = stream;
       void this.localVideo.play().catch(() => undefined);
-      await this.applyTier(this.quality.current(), epoch);
+      await this.applyTiers(epoch);
       if (this.isCurrent(epoch)) this.hooks.onStatus("Камера и микрофон снова работают");
     } catch {
       if (this.isCurrent(epoch)) this.hooks.onStatus("Разрешите камеру и микрофон ещё раз");
@@ -1233,10 +828,6 @@ export class CallSession {
     return epoch === this.epoch && !this.closed && this.started;
   }
 
-  private videoSender(): RTCRtpSender | undefined {
-    return this.pc?.getSenders().find((item) => item.track?.kind === "video");
-  }
-
   private finish(text: string, notifyServer: boolean, canRejoin = true): void {
     this.epoch += 1;
     this.closed = true;
@@ -1250,18 +841,14 @@ export class CallSession {
     this.socket = null;
     this.socketReady = false;
     this.stopMedia();
-    this.clearRemote();
     this.hooks.onEnded(text, canRejoin);
-    this.hooks.onPhase?.("ended");
-  }
-
-  /** A working call has nothing to announce. The status line speaks only when something needs saying. */
-  private linkStatus(): string {
-    return "";
+    this.setPhase("ended");
   }
 
   private stopMedia(): void {
-    this.dropConnection();
+    for (const link of this.links.values()) link.close();
+    this.links.clear();
+    this.publishPeers();
     this.localStream?.getTracks().forEach((track) => track.stop());
     this.localStream = null;
     this.localVideo.srcObject = null;
@@ -1272,60 +859,18 @@ export class CallSession {
   }
 
   private clearTimers(): void {
-    window.clearTimeout(this.disconnectedTimer);
     window.clearTimeout(this.reconnectTimer);
     window.clearInterval(this.statsTimer);
     window.clearInterval(this.pingTimer);
     this.statsTimer = 0;
     this.pingTimer = 0;
-    this.disconnectedTimer = 0;
     this.reconnectTimer = 0;
     window.clearTimeout(this.pongTimer);
-    window.clearTimeout(this.connectTimer);
     this.pongTimer = 0;
-    this.connectTimer = 0;
-    this.stopRecovery();
   }
 
   private resumeKey(): string {
     return `wirecall-resume:${this.roomId}`;
-  }
-}
-
-function asVideoSender(sender: RTCRtpSender): VideoSenderControl {
-  return {
-    get track() {
-      return sender.track as VideoTrackControl | null;
-    },
-    getParameters: () => sender.getParameters() as unknown as SenderParameters,
-    setParameters: (params) => sender.setParameters(params as unknown as RTCRtpSendParameters),
-  };
-}
-
-function asAudioSender(sender: RTCRtpSender): AudioSenderControl {
-  return {
-    getParameters: () => sender.getParameters() as unknown as SenderParameters,
-    setParameters: (params) => sender.setParameters(params as unknown as RTCRtpSendParameters),
-  };
-}
-
-function requestKeyFrame(sender: RTCRtpSender | undefined): void {
-  const generate = (sender as (RTCRtpSender & { generateKeyFrame?: () => Promise<unknown> }) | undefined)?.generateKeyFrame;
-  if (!sender || typeof generate !== "function") return;
-  try {
-    void generate.call(sender).catch(() => undefined);
-  } catch {
-    // The encoder sends a key frame by itself soon enough.
-  }
-}
-
-function cushionAudio(receiver: RTCRtpReceiver): void {
-  const target = receiver as unknown as Record<string, unknown>;
-  try {
-    if ("jitterBufferTarget" in target) target.jitterBufferTarget = AUDIO_JITTER_TARGET_MS;
-    else if ("playoutDelayHint" in target) target.playoutDelayHint = AUDIO_JITTER_TARGET_MS / 1000;
-  } catch {
-    // The browser keeps its own buffer.
   }
 }
 
@@ -1348,16 +893,6 @@ function limitLabel(limit: StatSummary["encoderLimit"]): string {
   if (limit === "bandwidth") return "полоса";
   if (limit === "cpu") return "процессор";
   return "другое";
-}
-
-function rtcCapabilities(kind: "audio" | "video"): CodecCap[] {
-  const caps = RTCRtpSender.getCapabilities?.(kind);
-  if (!caps) return [];
-  return kind === "video" ? preferredVideoCodecs(caps.codecs) : preferredAudioCodecs(caps.codecs);
-}
-
-function iceUp(pc: RTCPeerConnection): boolean {
-  return pc.iceConnectionState === "connected" || pc.iceConnectionState === "completed";
 }
 
 async function listCameras(): Promise<MediaDeviceInfo[]> {
@@ -1392,8 +927,10 @@ function mediaIssueText(reason: "denied" | "missing" | "busy" | "failed"): strin
   return "Не получилось включить камеру и микрофон";
 }
 
-function closeText(code: number, reason: string): string {
-  if (code === 4000 || reason === "room-full") return "В комнате уже двое. Создайте новую ссылку.";
+function closeText(code: number, reason: string, capacity: number): string {
+  if (code === 4000 || reason === "room-full") {
+    return capacity > PAIR_CAPACITY ? `В конференции нет мест. В ней уже ${capacity} человек.` : "В комнате уже двое. Создайте новую ссылку.";
+  }
   if (code === 4002 || reason === "replaced") return "Эта комната открыта в другом окне.";
   if (code === 4004 || reason === "expired") return "Ссылка устарела. Создайте новую.";
   if (reason === "rate") return "Слишком много попыток. Подождите немного.";
@@ -1403,4 +940,25 @@ function closeText(code: number, reason: string): string {
 
 function generationOf(value: unknown): number | null {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+function welcomePeers(value: unknown): WelcomePeer[] {
+  if (!Array.isArray(value)) return [];
+  const peers: WelcomePeer[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") continue;
+    const { peerId, gen, polite, online } = item as Record<string, unknown>;
+    const generation = generationOf(gen);
+    if (!isPeerId(peerId) || generation === null) continue;
+    peers.push({ peerId, gen: generation, polite: polite === true, online: online === true });
+  }
+  return peers;
+}
+
+function worstTier(tiers: readonly QualityTier[]): QualityTier | null {
+  let worst: QualityTier | null = null;
+  for (const tier of tiers) {
+    if (worst === null || TIER_ORDER.indexOf(tier) < TIER_ORDER.indexOf(worst)) worst = tier;
+  }
+  return worst;
 }

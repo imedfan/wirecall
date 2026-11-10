@@ -8,6 +8,7 @@ import {
   touchRoom,
   type IndexState,
 } from "../shared/room-index-state";
+import type { RoomKind } from "../shared/room-state";
 
 const PER_IP_LIMIT = 30;
 const PER_IP_WINDOW_MS = 60 * 60 * 1000;
@@ -21,7 +22,7 @@ export class RoomIndexDurableObject extends DurableObject<Env> {
     });
   }
 
-  async createRoom(ipHash: string, now: number, ttlMs: number): Promise<{ ok: true; roomId: string; expiresAt: number } | { ok: false; code: string }> {
+  async createRoom(ipHash: string, now: number, ttlMs: number, kind: RoomKind = "pair"): Promise<{ ok: true; roomId: string; expiresAt: number } | { ok: false; code: string }> {
     let created: { ok: true; roomId: string; expiresAt: number } | { ok: false; code: string } | null = null;
     for (let attempt = 0; attempt < 3 && !created; attempt += 1) {
       const current = this.read();
@@ -30,6 +31,7 @@ export class RoomIndexDurableObject extends DurableObject<Env> {
         ipHash,
         now,
         ttlMs,
+        kind,
         perIpLimit: PER_IP_LIMIT,
         perIpWindowMs: PER_IP_WINDOW_MS,
         dailyLimit: DAILY_LIMIT,
@@ -43,11 +45,11 @@ export class RoomIndexDurableObject extends DurableObject<Env> {
     return created;
   }
 
-  async lookup(roomId: string, now: number): Promise<{ expiresAt: number } | null> {
+  async lookup(roomId: string, now: number): Promise<{ expiresAt: number; kind: RoomKind } | null> {
     const result = lookupRoom(this.read(), roomId, now);
     this.write(result.state);
     await this.schedule(result.state);
-    return result.room ? { expiresAt: result.room.expiresAt } : null;
+    return result.room ? { expiresAt: result.room.expiresAt, kind: result.room.kind === "group" ? "group" : "pair" } : null;
   }
 
   async touch(roomId: string, expiresAt: number, now: number): Promise<void> {

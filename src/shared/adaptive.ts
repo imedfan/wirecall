@@ -49,6 +49,26 @@ export const TIER_PROFILES: Record<QualityTier, TierProfile> = {
   "very-weak": { tier: "very-weak", maxBitrate: 250_000, maxFramerate: 15, targetHeight: 480 },
 };
 
+/** Above this many other people the picture is one tile of a grid, and every extra person is one more outgoing video. */
+const GROUP_HEIGHT = 360;
+const GROUP_BITRATES: readonly number[] = [600_000, 450_000, 350_000, 300_000];
+
+/**
+ * What one outgoing video may cost when the call has this many other people in it. With one, the tier as it is.
+ * With more, the frame is a grid tile and the uplink is shared between them, so both the size and the
+ * bitrate get a lower ceiling. The frame rate stays the tier's own.
+ */
+export function profileFor(tier: QualityTier, remotes: number): TierProfile {
+  const profile = TIER_PROFILES[tier];
+  if (remotes < 2) return profile;
+  const cap = GROUP_BITRATES[Math.min(remotes - 2, GROUP_BITRATES.length - 1)]!;
+  return {
+    ...profile,
+    maxBitrate: Math.min(profile.maxBitrate, cap),
+    targetHeight: Math.min(profile.targetHeight, GROUP_HEIGHT),
+  };
+}
+
 const MIN_SAMPLE_GAP_MS = 1_500;
 // Down fast, up slowly: a call that stutters is worse than one that stays modest a little too long.
 const STREAK_DOWN = 2;
@@ -122,6 +142,9 @@ export class AdaptiveController {
   private smooth = new Smoother();
   private lastScore: number | null = null;
 
+  /** The profile of a tier may depend on the call, as it does in a conference. The ladder itself does not. */
+  constructor(private readonly profileOf: (tier: QualityTier) => TierProfile = (tier) => TIER_PROFILES[tier]) {}
+
   observe(sample: NetworkSample): ControllerDecision {
     if (sample.atMs - this.lastSampleAt < MIN_SAMPLE_GAP_MS) return this.hold("gap");
     this.lastSampleAt = sample.atMs;
@@ -134,7 +157,7 @@ export class AdaptiveController {
 
     const severe = rawScore !== null && rawScore <= SEVERE_SCORE;
     const deserved = score === null ? this.tier : tierForScore(score);
-    const starved = bitrate !== undefined && bitrate < TIER_PROFILES[this.tier].maxBitrate * KEEP_BITRATE;
+    const starved = bitrate !== undefined && bitrate < this.profileOf(this.tier).maxBitrate * KEEP_BITRATE;
     if (severe || starved || rank(deserved) < rank(this.tier)) {
       this.goodStreak = 0;
       this.badStreak = severe ? STREAK_DOWN : this.badStreak + 1;
@@ -149,7 +172,7 @@ export class AdaptiveController {
     const limited = smoothed.encoderLimit === "bandwidth" || smoothed.encoderLimit === "cpu";
     // Without any score there is no evidence the link is good. Bitrate alone only ever lowers the tier.
     const clean = score !== null && score >= SCORE_FLOOR[next] + UP_MARGIN && !limited;
-    const room = bitrate === undefined || bitrate >= TIER_PROFILES[next].maxBitrate * UP_BITRATE;
+    const room = bitrate === undefined || bitrate >= this.profileOf(next).maxBitrate * UP_BITRATE;
     if (!clean || !room) {
       this.goodStreak = 0;
       return this.hold(clean ? "needs-bitrate" : "hold");
@@ -207,7 +230,11 @@ export class AdaptiveController {
 
 /** How much to shrink the frame so its shorter side matches the tier. Never enlarges. */
 export function scaleForHeight(actualShortSide: number | undefined, tier: QualityTier): number {
-  const target = TIER_PROFILES[tier].targetHeight;
+  return scaleToHeight(actualShortSide, TIER_PROFILES[tier].targetHeight);
+}
+
+/** The same for a height given directly. An unknown frame is taken to be what the camera is asked for, 720p. */
+export function scaleToHeight(actualShortSide: number | undefined, target: number): number {
   if (!actualShortSide || actualShortSide <= 0) return Math.max(1, TIER_PROFILES[START_TIER].targetHeight / target);
   return Math.max(1, actualShortSide / target);
 }

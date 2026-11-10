@@ -1,13 +1,14 @@
 import { DurableObject } from "cloudflare:workers";
 import { createResumeToken, isResumeToken, isRoomId, sha256Hex } from "../shared/ids";
 import type { IceServer } from "../shared/ice-servers";
-import { parseClientMessage, type ClientMessage, type SignalKind } from "../shared/protocol";
-import { bumpRate } from "../shared/rate";
+import { parseClientMessage, PROTOCOL_VERSION, type ClientMessage } from "../shared/protocol";
 import {
   admitPeer,
   leavePeer,
+  linkGen,
   newRoom,
-  rebuildRoom,
+  parseCapacity,
+  rebuildLink,
   relaySignal,
   touchPeer,
   type RoomState,
@@ -21,9 +22,13 @@ interface SocketAttachment {
   role: "pending" | "peer";
   peerId?: string;
   at: number;
-  stamps: number[];
+  /** Messages in the current window. Two numbers, so the attachment stays small however busy the socket is. */
+  windowStart: number;
+  windowCount: number;
   expiresAt: number;
   roomId: string;
+  /** How many people the room holds: two, or a conference. The index decides, not the client. */
+  capacity: number;
 }
 
 interface TurnCache {
@@ -32,10 +37,11 @@ interface TurnCache {
   expiresAt: number;
 }
 
-const MAX_SOCKETS = 4;
+/** Sockets beyond the seats: a returning peer opens its new one before the old one is closed. */
+const SPARE_SOCKETS = 2;
 const MESSAGE_WINDOW_MS = 10_000;
-// A Mac with several interfaces plus TURN trickles dozens of candidates per ICE restart.
-const MESSAGE_LIMIT = 100;
+// A Mac with several interfaces plus TURN trickles dozens of candidates per ICE restart, to every peer it is linked with.
+const MESSAGE_LIMIT_PER_LINK = 100;
 const INDEX_TOUCH_MS = 60 * 60 * 1000;
 
 export class RoomDurableObject extends DurableObject<Env> {
@@ -52,11 +58,12 @@ export class RoomDurableObject extends DurableObject<Env> {
     }
     const expiry = Number(request.headers.get("x-wirecall-expires"));
     const roomId = request.headers.get("x-wirecall-room") ?? "";
+    const capacity = parseCapacity(request.headers.get("x-wirecall-capacity"));
     if (!Number.isFinite(expiry) || expiry <= Date.now() || !isRoomId(roomId)) {
       return Response.json({ error: "expired" }, { status: 410 });
     }
     this.ensureSchema();
-    if (this.ctx.getWebSockets().length >= MAX_SOCKETS) {
+    if (this.ctx.getWebSockets().length >= capacity + SPARE_SOCKETS) {
       return Response.json({ error: "room-full" }, { status: 409 });
     }
     this.rememberRoom(roomId);
@@ -67,9 +74,11 @@ export class RoomDurableObject extends DurableObject<Env> {
     server.serializeAttachment({
       role: "pending",
       at: Date.now(),
-      stamps: [],
+      windowStart: 0,
+      windowCount: 0,
       expiresAt: expiry,
       roomId,
+      capacity,
     } satisfies SocketAttachment);
     return new Response(null, { status: 101, webSocket: client });
   }
@@ -80,10 +89,14 @@ export class RoomDurableObject extends DurableObject<Env> {
       return;
     }
     const attachment = readAttachment(ws);
-    const rate = bumpRate(attachment.stamps, Date.now(), MESSAGE_WINDOW_MS, MESSAGE_LIMIT);
-    attachment.stamps = rate.stamps;
+    const now = Date.now();
+    if (now - attachment.windowStart >= MESSAGE_WINDOW_MS) {
+      attachment.windowStart = now;
+      attachment.windowCount = 0;
+    }
+    attachment.windowCount += 1;
     ws.serializeAttachment(attachment);
-    if (!rate.ok) {
+    if (attachment.windowCount > MESSAGE_LIMIT_PER_LINK * (attachment.capacity - 1)) {
       ws.close(1008, "rate");
       return;
     }
@@ -114,7 +127,7 @@ export class RoomDurableObject extends DurableObject<Env> {
     if (!state || !state.peers.some((peer) => peer.peerId === attachment.peerId)) return;
     // The seat and resume hash stay so the same person can hello again. Hangup and the stale sweep remove it.
     // gone: false tells the other side to keep its media connection: only the signaling socket is away.
-    this.sendToPeers({ type: "peer-left", gone: false, peerCount: state.peers.length }, attachment.peerId);
+    this.sendToPeers({ type: "peer-left", peerId: attachment.peerId, gone: false, peerCount: state.peers.length }, attachment.peerId);
     if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CLOSING) ws.close(1001, "dropped");
     logEvent("socket-closed", { peers: state.peers.length });
   }
@@ -129,11 +142,8 @@ export class RoomDurableObject extends DurableObject<Env> {
     if (!state) return;
     if (Date.now() >= state.expiresAt) {
       for (const socket of this.ctx.getWebSockets()) socket.close(4004, "expired");
-      this.ctx.storage.sql.exec("DELETE FROM meta");
-      this.ctx.storage.sql.exec("DELETE FROM peers");
-      this.ctx.storage.sql.exec("DELETE FROM signals");
+      this.ctx.storage.sql.exec("DELETE FROM room");
       this.ctx.storage.sql.exec("DELETE FROM turn_cache");
-      this.ctx.storage.sql.exec("DELETE FROM session");
       await this.ctx.storage.deleteAlarm();
       logEvent("room-expired");
       return;
@@ -152,7 +162,7 @@ export class RoomDurableObject extends DurableObject<Env> {
     const newResumeHash = await sha256Hex(resumeToken);
     const now = Date.now();
     const ttlMs = ttlFromEnv(this.env);
-    // Hashes are ready before the read. The two-peer decision and the write stay synchronous.
+    // Hashes are ready before the read. The decision about the seat and the write stay synchronous.
     let state = this.readRoom() ?? newRoom(now, Math.max(ttlMs, attachment.expiresAt - now));
     if (attachment.expiresAt > state.expiresAt) state = { ...state, expiresAt: attachment.expiresAt };
     const admitted = admitPeer(state, {
@@ -162,7 +172,8 @@ export class RoomDurableObject extends DurableObject<Env> {
       newPeerId: crypto.randomUUID(),
       newResumeHash,
       livePeerIds: livePeers(this.ctx.getWebSockets(), ws),
-      keepGen: hello.gen ?? null,
+      capacity: attachment.capacity,
+      keep: hello.keep ?? null,
     });
     if (!admitted.ok) {
       this.writeRoom(admitted.state);
@@ -174,34 +185,32 @@ export class RoomDurableObject extends DurableObject<Env> {
     this.writeRoom(admitted.state);
     ws.serializeAttachment({ ...attachment, role: "peer", peerId: admitted.peerId });
     if (admitted.resumed) closeOtherSockets(this.ctx.getWebSockets(), admitted.peerId, ws);
-    const peerOnline = livePeers(this.ctx.getWebSockets(), ws).some((id) => id !== admitted.peerId);
+    const online = livePeers(this.ctx.getWebSockets(), ws);
     this.send(ws, {
       type: "welcome",
-      protocol: 1,
+      protocol: PROTOCOL_VERSION,
       peerId: admitted.peerId,
-      polite: admitted.polite,
+      capacity: attachment.capacity,
       peerCount: admitted.peerCount,
       expiresAt: admitted.expiresAt,
       resumed: admitted.resumed,
-      gen: admitted.gen,
-      peerOnline,
+      peers: admitted.links.map((link) => ({ peerId: link.peerId, gen: link.gen, polite: link.polite, online: online.includes(link.peerId) })),
       turnMode: ice.mode,
       iceServers: ice.iceServers,
       resumeToken,
     });
-    if (admitted.notify !== "none") {
+    for (const link of admitted.links) {
       // An unchanged gen means the returning peer kept its connection and the other side keeps its own too.
-      // A new gen makes both start a fresh one, with TURN credentials that are still valid.
-      this.sendToPeers(
-        {
-          type: admitted.notify === "joined" ? "peer-joined" : "peer-back",
-          gen: admitted.gen,
-          peerCount: admitted.peerCount,
-          turnMode: ice.mode,
-          iceServers: ice.iceServers,
-        },
-        admitted.peerId,
-      );
+      // A new gen makes the two start a fresh one, with TURN credentials that are still valid.
+      this.sendToPeer(link.peerId, {
+        type: admitted.resumed ? "peer-back" : "peer-joined",
+        peerId: admitted.peerId,
+        gen: link.gen,
+        polite: !link.polite,
+        peerCount: admitted.peerCount,
+        turnMode: ice.mode,
+        iceServers: ice.iceServers,
+      });
     }
     logEvent("peer-joined", { peers: admitted.peerCount, resumed: admitted.resumed, turnMode: ice.mode });
     await this.schedule(admitted.state);
@@ -227,7 +236,7 @@ export class RoomDurableObject extends DurableObject<Env> {
       this.writeRoom(touched.state);
       for (const removed of touched.removedPeerIds) {
         closePeerSockets(this.ctx.getWebSockets(), removed);
-        this.sendToPeers({ type: "peer-left", gone: true, peerCount: touched.state.peers.length });
+        this.sendToPeers({ type: "peer-left", peerId: removed, gone: true, peerCount: touched.state.peers.length });
       }
       if (!touched.known) {
         ws.close(4004, "expired");
@@ -240,17 +249,19 @@ export class RoomDurableObject extends DurableObject<Env> {
     if (message.type === "hangup") {
       const left = leavePeer(state, peerId);
       this.writeRoom(left.state);
-      this.sendToPeers({ type: "peer-left", gone: true, peerCount: left.peerCount }, peerId);
+      this.sendToPeers({ type: "peer-left", peerId, gone: true, peerCount: left.peerCount }, peerId);
       ws.close(1000, "hangup");
       return;
     }
     if (message.type === "restart") {
       // The side that may not offer asks the offering side for an ICE restart, and gets an ack back.
-      if (message.gen === state.gen) this.sendToPeers({ type: "restart", gen: message.gen, ack: message.ack }, peerId);
+      if (linkGen(state, peerId, message.to) === message.gen) {
+        this.sendToPeer(message.to, { type: "restart", from: peerId, gen: message.gen, ack: message.ack });
+      }
       return;
     }
     if (message.type === "rebuild") {
-      this.ctx.waitUntil(this.rebuild(message.gen));
+      this.ctx.waitUntil(this.rebuild(peerId, message.to, message.gen));
       return;
     }
     if (message.type !== "signal") {
@@ -261,31 +272,34 @@ export class RoomDurableObject extends DurableObject<Env> {
       now,
       ttlMs,
       fromPeerId: peerId,
-      kind: message.kind,
-      payload: message.payload,
-      livePeerIds,
+      toPeerId: message.to,
       gen: message.gen,
+      livePeerIds,
     });
     if (!relayed.ok) {
       ws.close(1008, relayed.code);
       return;
     }
     this.writeRoom(relayed.state);
-    const outbound = { type: "signal" as const, kind: message.kind, payload: message.payload, gen: message.gen };
-    for (const target of relayed.toPeerIds) this.sendToPeer(target, outbound);
-    logEvent("signal", { kind: message.kind, bytes: message.payload.length, targets: relayed.toPeerIds.length, stale: relayed.stale });
+    if (relayed.deliver) {
+      this.sendToPeer(message.to, { type: "signal", from: peerId, kind: message.kind, payload: message.payload, gen: message.gen });
+    }
+    logEvent("signal", { kind: message.kind, bytes: message.payload.length, stale: !relayed.deliver });
     this.touchIndex(attachment.roomId, relayed.state.expiresAt, false);
   }
 
-  private async rebuild(gen: number): Promise<void> {
+  private async rebuild(fromPeerId: string, toPeerId: string, gen: number): Promise<void> {
     const ice = await this.iceServers();
     const state = this.readRoom();
     if (!state) return;
-    const next = rebuildRoom(state, gen);
-    // A request for an older generation is the second of two simultaneous ones. The room has already rebuilt.
+    const next = rebuildLink(state, fromPeerId, toPeerId, gen);
+    // A request for an older generation is the second of two simultaneous ones. The pair has already rebuilt.
     if (!next.bumped) return;
     this.writeRoom(next.state);
-    this.sendToPeers({ type: "rebuild", gen: next.state.gen, peerCount: next.state.peers.length, turnMode: ice.mode, iceServers: ice.iceServers });
+    const fresh = { type: "rebuild", gen: next.gen, peerCount: next.state.peers.length, turnMode: ice.mode, iceServers: ice.iceServers };
+    // Only these two start over. Everyone else in the room keeps talking on the connections they have.
+    this.sendToPeer(fromPeerId, { ...fresh, peerId: toPeerId });
+    this.sendToPeer(toPeerId, { ...fresh, peerId: fromPeerId });
     logEvent("room-rebuild", { peers: next.state.peers.length });
   }
 
@@ -334,25 +348,9 @@ export class RoomDurableObject extends DurableObject<Env> {
 
   private ensureSchema(): void {
     this.ctx.storage.sql.exec(`
-      CREATE TABLE IF NOT EXISTS meta (
+      CREATE TABLE IF NOT EXISTS room (
         id INTEGER PRIMARY KEY CHECK (id = 1),
-        created_at INTEGER NOT NULL,
-        expires_at INTEGER NOT NULL,
-        join_window_start INTEGER NOT NULL,
-        join_count INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS peers (
-        peer_id TEXT PRIMARY KEY,
-        resume_hash TEXT NOT NULL,
-        polite INTEGER NOT NULL,
-        joined_at INTEGER NOT NULL,
-        last_seen INTEGER NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS signals (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        from_peer TEXT NOT NULL,
-        kind TEXT NOT NULL,
-        payload TEXT NOT NULL
+        body TEXT NOT NULL
       );
       CREATE TABLE IF NOT EXISTS turn_cache (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -360,92 +358,32 @@ export class RoomDurableObject extends DurableObject<Env> {
         body TEXT NOT NULL,
         expires_at INTEGER NOT NULL
       );
-      CREATE TABLE IF NOT EXISTS session (
-        id INTEGER PRIMARY KEY CHECK (id = 1),
-        gen INTEGER NOT NULL
-      );
       CREATE TABLE IF NOT EXISTS runtime (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         room_id TEXT NOT NULL,
         index_touch INTEGER NOT NULL
       );
+      -- Seats of the two-person protocol. Its pages cannot join any more, so nothing reads these.
+      DROP TABLE IF EXISTS meta;
+      DROP TABLE IF EXISTS peers;
+      DROP TABLE IF EXISTS signals;
+      DROP TABLE IF EXISTS session;
     `);
   }
 
   private readRoom(): RoomState | null {
     this.ensureSchema();
-    const meta = this.ctx.storage.sql
-      .exec<{ created_at: number; expires_at: number; join_window_start: number; join_count: number }>(
-        "SELECT created_at, expires_at, join_window_start, join_count FROM meta WHERE id = 1",
-      )
-      .toArray()[0];
-    if (!meta) return null;
-    const peers = this.ctx.storage.sql
-      .exec<{ peer_id: string; resume_hash: string; polite: number; joined_at: number; last_seen: number }>(
-        "SELECT peer_id, resume_hash, polite, joined_at, last_seen FROM peers",
-      )
-      .toArray()
-      .map((row) => ({
-        peerId: row.peer_id,
-        resumeHash: row.resume_hash,
-        polite: row.polite === 1,
-        joinedAt: row.joined_at,
-        lastSeen: row.last_seen,
-      }));
-    const queued = this.ctx.storage.sql
-      .exec<{ from_peer: string; kind: SignalKind; payload: string }>("SELECT from_peer, kind, payload FROM signals ORDER BY id")
-      .toArray()
-      .map((row) => ({ fromPeerId: row.from_peer, kind: row.kind, payload: row.payload }));
-    const session = this.ctx.storage.sql.exec<{ gen: number }>("SELECT gen FROM session WHERE id = 1").toArray()[0];
-    return {
-      createdAt: meta.created_at,
-      expiresAt: meta.expires_at,
-      joinWindowStart: meta.join_window_start,
-      joinCount: meta.join_count,
-      peers,
-      queued,
-      gen: session?.gen ?? 0,
-    };
+    const row = this.ctx.storage.sql.exec<{ body: string }>("SELECT body FROM room WHERE id = 1").toArray()[0];
+    if (!row) return null;
+    return JSON.parse(row.body) as RoomState;
   }
 
+  /** The whole room is one small row: a handful of seats and the generation of each pair. */
   private writeRoom(state: RoomState): void {
-    this.ctx.storage.sql.exec("DELETE FROM signals");
-    this.ctx.storage.sql.exec("DELETE FROM peers");
     this.ctx.storage.sql.exec(
-      `INSERT INTO meta (id, created_at, expires_at, join_window_start, join_count)
-       VALUES (1, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         created_at = excluded.created_at,
-         expires_at = excluded.expires_at,
-         join_window_start = excluded.join_window_start,
-         join_count = excluded.join_count`,
-      state.createdAt,
-      state.expiresAt,
-      state.joinWindowStart,
-      state.joinCount,
+      "INSERT INTO room (id, body) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET body = excluded.body",
+      JSON.stringify(state),
     );
-    this.ctx.storage.sql.exec(
-      "INSERT INTO session (id, gen) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET gen = excluded.gen",
-      state.gen,
-    );
-    for (const peer of state.peers) {
-      this.ctx.storage.sql.exec(
-        "INSERT INTO peers (peer_id, resume_hash, polite, joined_at, last_seen) VALUES (?, ?, ?, ?, ?)",
-        peer.peerId,
-        peer.resumeHash,
-        peer.polite ? 1 : 0,
-        peer.joinedAt,
-        peer.lastSeen,
-      );
-    }
-    for (const signal of state.queued) {
-      this.ctx.storage.sql.exec(
-        "INSERT INTO signals (from_peer, kind, payload) VALUES (?, ?, ?)",
-        signal.fromPeerId,
-        signal.kind,
-        signal.payload,
-      );
-    }
   }
 
   private readTurn(): TurnCache | null {
@@ -504,16 +442,18 @@ function ttlFromEnv(env: Env): number {
 
 function readAttachment(ws: WebSocket): SocketAttachment {
   const value = ws.deserializeAttachment() as Partial<SocketAttachment> | null;
-  if (!value || (value.role !== "pending" && value.role !== "peer") || !Array.isArray(value.stamps)) {
-    return { role: "pending", at: Date.now(), stamps: [], expiresAt: 0, roomId: "" };
+  if (!value || (value.role !== "pending" && value.role !== "peer")) {
+    return { role: "pending", at: Date.now(), windowStart: 0, windowCount: 0, expiresAt: 0, roomId: "", capacity: parseCapacity(undefined) };
   }
   return {
     role: value.role,
     peerId: value.peerId,
     at: value.at ?? Date.now(),
-    stamps: value.stamps.filter((stamp) => typeof stamp === "number"),
+    windowStart: value.windowStart ?? 0,
+    windowCount: value.windowCount ?? 0,
     expiresAt: value.expiresAt ?? 0,
     roomId: value.roomId ?? "",
+    capacity: parseCapacity(value.capacity),
   };
 }
 

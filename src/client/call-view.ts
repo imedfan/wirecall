@@ -1,6 +1,8 @@
 import { START_TIER, type QualityTier } from "../shared/adaptive";
 import { autoHideDelay, isWeakTier, mayAutoHide, mayHide, type ChromeContext, type InputKind } from "../shared/chrome-visibility";
+import { gridLayout, type Rect } from "../shared/grid";
 import { qualityBadge } from "../shared/quality-label";
+import { GROUP_CAPACITY, PAIR_CAPACITY } from "../shared/room-state";
 import {
   clampToBox,
   CORNER_STORAGE_KEY,
@@ -16,7 +18,7 @@ import {
   type Point,
   type Size,
 } from "../shared/self-view";
-import { CallSession, type CallPhase } from "./call-session";
+import { CallSession, type CallPhase, type RemotePeer } from "./call-session";
 import { aurora, button, canShare, el, flashLabel, iconSvg, isIPhone, linkButton, shareLink, sheet, type IconName } from "./ui";
 
 type MediaIssue = "denied" | "missing" | "busy" | "failed";
@@ -30,18 +32,29 @@ const DRAG_START_PX = 6;
 const LIVE_NOTE_MS = 6_000;
 /** After a click hides the controls the cursor still trembles. That is not a request to show them again. */
 const MOVE_QUIET_MS = 600;
+/** Space between the pictures of a conference, and between them and the screen edge. */
+const GRID_GAP = 6;
 
-export function renderCall(root: HTMLElement, roomId: string): void {
+/** One other person on the stage: the frame that is moved and sized, the picture, a line about the connection. */
+interface Tile {
+  root: HTMLElement;
+  video: HTMLVideoElement;
+  note: HTMLElement;
+}
+
+/** `group` is what the link says: a room for two or a conference. The room confirms it when it lets the person in. */
+export function renderCall(root: HTMLElement, roomId: string, group = false): void {
+  let capacity = group ? GROUP_CAPACITY : PAIR_CAPACITY;
+  const isGroup = (): boolean => capacity > PAIR_CAPACITY;
   const page = el("section", "call");
   page.dataset.phase = "idle";
   page.dataset.ui = "shown";
   page.dataset.preview = "off";
 
+  // One tile per other person. With one, it fills the screen; with more, they share it as a grid.
   const stage = el("div", "stage");
-  const remote = el("video", "remote");
-  remote.setAttribute("playsinline", "");
-  remote.autoplay = true;
-  stage.append(remote);
+  stage.dataset.layout = "single";
+  const tiles = new Map<string, Tile>();
 
   // The wrapper is moved and sized; the video inside keeps its own mirror transform.
   const self = el("div", "self");
@@ -76,11 +89,11 @@ export function renderCall(root: HTMLElement, roomId: string): void {
   const pulse = el("div", "pulse");
   pulse.setAttribute("aria-hidden", "true");
   pulse.append(el("i"), el("i"));
-  const status = el("p", "status", "Готовы войти");
+  const status = el("p", "status", group ? "Конференция" : "Готовы войти");
   status.setAttribute("role", "status");
   status.setAttribute("aria-live", "polite");
-  const statusNote = el("p", "status-note");
-  statusNote.hidden = true;
+  const statusNote = el("p", "status-note", group ? `До ${capacity} человек` : "");
+  statusNote.hidden = !group;
   const issue = el("div", "media-issue glass");
   issue.hidden = true;
 
@@ -94,7 +107,7 @@ export function renderCall(root: HTMLElement, roomId: string): void {
   meter.append(meterBar);
   lobby.append(lobbyMic, meter, lobbyCam);
 
-  const join = button("Войти в звонок");
+  const join = button(group ? "Войти в конференцию" : "Войти в звонок");
   join.classList.add("btn-hero", "join");
   const fresh = linkButton("Создать новую ссылку", "/");
   fresh.classList.add("btn-hero", "fresh");
@@ -143,7 +156,14 @@ export function renderCall(root: HTMLElement, roomId: string): void {
   const diagRow = el("button", "row");
   diagRow.type = "button";
   diagRow.append(el("span", "", "Диагностика"), el("span", "chevron", "›"));
-  settings.body.append(fitSwitch, diagRow);
+  // A conference can grow during the call, so the link is at hand here too, with the seats taken so far.
+  const inviteRow = el("button", "row invite");
+  inviteRow.type = "button";
+  const inviteLabel = el("span", "", "Пригласить по ссылке");
+  const inviteCount = el("span", "seats");
+  inviteRow.append(inviteLabel, inviteCount);
+  inviteRow.hidden = !group;
+  settings.body.append(fitSwitch, inviteRow, diagRow);
 
   const diagnostics = sheet("Диагностика");
   const diagMain = el("div", "diag");
@@ -284,12 +304,28 @@ export function renderCall(root: HTMLElement, roomId: string): void {
   };
   function layoutSelf(): void {
     const nowPip = phase === "live" || phase === "trouble";
+    const ownCell = layoutStage(nowPip);
     if (!nowPip) {
       // Before the call connects the own picture fills the screen; the stylesheet does that.
       pip = false;
       drag = null;
-      self.classList.remove("pip", "dragging");
+      self.classList.remove("pip", "dragging", "tiled");
       for (const property of ["width", "height", "transform"]) self.style.removeProperty(property);
+      return;
+    }
+    self.classList.toggle("tiled", ownCell !== null);
+    if (ownCell) {
+      // In a conference the own picture is one more tile of the grid. It is not dragged anywhere.
+      drag = null;
+      const fresh = !pip;
+      pip = true;
+      self.classList.add("pip");
+      self.classList.toggle("dragging", fresh);
+      placeSelf({ x: ownCell.x, y: ownCell.y }, { width: ownCell.width, height: ownCell.height });
+      if (fresh) {
+        void self.offsetWidth;
+        self.classList.remove("dragging");
+      }
       return;
     }
     const size = selfSize(viewportOf(page), selfRatio);
@@ -314,7 +350,7 @@ export function renderCall(root: HTMLElement, roomId: string): void {
   }
 
   self.addEventListener("pointerdown", (event) => {
-    if (!pip || event.button !== 0 || drag) return;
+    if (!pip || event.button !== 0 || drag || self.classList.contains("tiled")) return;
     drag = { pointer: event.pointerId, startX: event.clientX, startY: event.clientY, origin: selfAt, moved: false };
     self.setPointerCapture?.(event.pointerId);
   });
@@ -349,29 +385,118 @@ export function renderCall(root: HTMLElement, roomId: string): void {
   local.addEventListener("loadedmetadata", readSelfRatio);
   if (typeof ResizeObserver === "function") new ResizeObserver(() => layoutSelf()).observe(controls);
 
-  // ---- How the other person's picture fills the screen ----
+  // ---- The other people: one tile each ----
+  /**
+   * Places the tiles. One person fills the screen, as in a call for two. More share it as a grid, and
+   * during the call the own picture takes the last cell: its place is returned, or null when it stays a window.
+   */
+  function layoutStage(withSelf: boolean): Rect | null {
+    const list = [...tiles.values()];
+    const grid = list.length >= 2;
+    stage.dataset.layout = grid ? "grid" : "single";
+    if (!grid) {
+      for (const tile of list) for (const property of ["width", "height", "transform"]) tile.root.style.removeProperty(property);
+      return null;
+    }
+    const box = safeBox(viewportOf(page), insetsOf(probe), GRID_GAP);
+    const area: Rect = { x: box.left, y: box.top, width: box.right - box.left, height: box.bottom - box.top };
+    const cells = gridLayout(area, list.length + (withSelf ? 1 : 0), GRID_GAP);
+    list.forEach((tile, index) => {
+      const cell = cells[index];
+      if (!cell) return;
+      tile.root.style.setProperty("width", `${Math.round(cell.width)}px`);
+      tile.root.style.setProperty("height", `${Math.round(cell.height)}px`);
+      tile.root.style.setProperty("transform", `translate3d(${Math.round(cell.x)}px, ${Math.round(cell.y)}px, 0)`);
+    });
+    return withSelf ? (cells[list.length] ?? null) : null;
+  }
+
+  // ---- How each picture fills its tile ----
   let userFit: boolean | null = null;
   const fitRemote = (): void => {
-    let auto = false;
-    if (remote.videoWidth && remote.videoHeight && !isPhone(viewportOf(page))) {
-      // A portrait iPhone picture on a wide Mac window is shown whole, not cropped to a strip of forehead.
-      // On a phone the picture always fills the screen, with a soft crop at the sides.
-      auto = (remote.videoHeight > remote.videoWidth) !== (stage.clientHeight > stage.clientWidth);
+    let shown = false;
+    for (const { root: frame, video } of tiles.values()) {
+      let auto = false;
+      if (video.videoWidth && video.videoHeight && !isPhone(viewportOf(page))) {
+        // A portrait iPhone picture on a wide Mac window is shown whole, not cropped to a strip of forehead.
+        // On a phone the picture always fills its place, with a soft crop at the sides.
+        auto = (video.videoHeight > video.videoWidth) !== (frame.clientHeight > frame.clientWidth);
+      }
+      const whole = userFit ?? auto;
+      video.classList.toggle("contain", whole);
+      shown ||= whole;
     }
-    const whole = userFit ?? auto;
-    remote.classList.toggle("contain", whole);
-    fitSwitch.setAttribute("aria-checked", String(whole));
+    fitSwitch.setAttribute("aria-checked", String(userFit ?? shown));
   };
   fitSwitch.addEventListener("click", () => {
     userFit = fitSwitch.getAttribute("aria-checked") !== "true";
     fitRemote();
   });
-  remote.addEventListener("resize", fitRemote);
-  remote.addEventListener("loadedmetadata", fitRemote);
   window.addEventListener("resize", () => {
-    fitRemote();
     layoutSelf();
+    fitRemote();
   });
+
+  /** Starts every picture and voice on screen. A browser that refuses gets the «Включить звук» button. */
+  const playAll = async (): Promise<void> => {
+    let blocked = false;
+    for (const { video } of tiles.values()) {
+      if (!video.srcObject) continue;
+      try {
+        await video.play();
+      } catch {
+        blocked = true;
+      }
+    }
+    audio.hidden = !blocked;
+  };
+
+  const showPeers = (peers: RemotePeer[]): void => {
+    for (const [id, tile] of tiles) {
+      if (peers.some((peer) => peer.id === id)) continue;
+      tile.video.srcObject = null;
+      tile.root.remove();
+      tiles.delete(id);
+    }
+    let fresh = false;
+    for (const peer of peers) {
+      let tile = tiles.get(peer.id);
+      if (!tile) {
+        const frame = el("div", "tile");
+        const video = el("video", "remote");
+        video.setAttribute("playsinline", "");
+        video.playsInline = true;
+        video.autoplay = true;
+        video.addEventListener("resize", fitRemote);
+        video.addEventListener("loadedmetadata", fitRemote);
+        const note = el("p", "tile-note");
+        frame.append(video, note);
+        stage.append(frame);
+        tile = { root: frame, video, note };
+        tiles.set(peer.id, tile);
+        fresh = true;
+      }
+      // The last picture stays, dimmed, while a connection is rebuilt: only a new stream replaces it.
+      if (peer.stream && tile.video.srcObject !== peer.stream) {
+        tile.video.srcObject = peer.stream;
+        fresh = true;
+      }
+      tile.root.dataset.phase = peer.phase;
+      const weak = peer.phase === "live" && peer.tier !== null && isWeakTier(peer.tier);
+      tile.root.dataset.weak = String(weak);
+      // What is wrong with this one person, on their own picture. The rest of the call goes on.
+      const text = peer.phase === "live" ? (weak ? "Слабая связь" : "") : peer.phase === "connecting" ? "Соединяем" : (peer.note.split(". ")[0] ?? "");
+      if (tile.note.textContent !== text) tile.note.textContent = text;
+    }
+    const seats = `${peers.length + 1} из ${capacity}`;
+    if (inviteCount.textContent !== seats) inviteCount.textContent = seats;
+    // A full conference has nobody left to invite.
+    inviteRow.disabled = peers.length + 1 >= capacity;
+    stage.dataset.count = String(peers.length);
+    layoutSelf();
+    fitRemote();
+    if (fresh) void playAll();
+  };
 
   // ---- Microphone level in the lobby ----
   let stopMeter: (() => void) | null = null;
@@ -396,7 +521,7 @@ export function renderCall(root: HTMLElement, roomId: string): void {
     layoutSelf();
   };
 
-  const session = new CallSession(roomId, local, remote, {
+  const session = new CallSession(roomId, local, {
     onStatus: showStatus,
     onDiagnostics: (main, rest) => {
       diagMain.replaceChildren(...main.map(diagLine));
@@ -404,6 +529,12 @@ export function renderCall(root: HTMLElement, roomId: string): void {
     },
     onAudioBlocked: (blocked) => {
       audio.hidden = !blocked;
+    },
+    onPeers: showPeers,
+    onPlayback: () => void playAll(),
+    onCapacity: (seats) => {
+      capacity = seats;
+      inviteRow.hidden = !isGroup();
     },
     onMediaIssue: (reason) => {
       issue.hidden = reason === null;
@@ -419,13 +550,13 @@ export function renderCall(root: HTMLElement, roomId: string): void {
       audio.hidden = true;
       for (const dialog of [settings.dialog, diagnostics.dialog]) if (dialog.open) dialog.close();
     },
-    onWaiting: (waiting) => showStatus(waiting ? "Ждём второго человека" : "Соединяем"),
+    onWaiting: (waiting) => showStatus(waiting ? (isGroup() ? "Ждём участников" : "Ждём второго человека") : "Соединяем"),
     onPhase: setPhase,
     onQuality: showQuality,
     onCameras: (count) => {
       flip.hidden = count < 2;
     },
-  });
+  }, group);
   showQuality(START_TIER, null);
   setPhase("idle");
 
@@ -434,7 +565,8 @@ export function renderCall(root: HTMLElement, roomId: string): void {
     setPhase("starting");
     void session.start();
   });
-  audio.addEventListener("click", () => void session.playRemote());
+  audio.addEventListener("click", () => void playAll());
+  inviteRow.addEventListener("click", () => void shareLink(location.href, flashLabel(inviteLabel)));
   retry.addEventListener("click", () => session.retry());
   share.addEventListener("click", () => void shareLink(location.href, flashLabel(share)));
   shareCorner.addEventListener("click", () => {

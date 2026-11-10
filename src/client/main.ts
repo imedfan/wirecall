@@ -9,10 +9,11 @@ if (!app) throw new Error("missing app");
 watchPageVisibility();
 if (!window.isSecureContext) {
   app.replaceChildren(messageScreen("Нужен HTTPS", "Откройте ссылку, которая начинается с https://."));
-} else if (location.pathname.startsWith("/r/")) {
+} else if (location.pathname.startsWith("/r/") || location.pathname.startsWith("/c/")) {
   const roomId = location.pathname.split("/")[2] ?? "";
   if (!isRoomId(roomId)) app.replaceChildren(messageScreen("Комната не найдена", "Попросите прислать ссылку ещё раз.", linkButton("На главную", "/")));
-  else renderCall(app, roomId);
+  // /c/ is a conference link. The letter only picks the words of the lobby; the room knows its own size.
+  else renderCall(app, roomId, location.pathname.startsWith("/c/"));
 } else {
   void renderHome(app);
 }
