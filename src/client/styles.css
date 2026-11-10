@@ -284,22 +284,13 @@ video.local.off { opacity: 0.35; }
   text-shadow: 0 2px 14px rgba(0, 0, 0, 0.6);
 }
 
-.status::before {
-  content: "";
-  display: none;
-  flex: none;
-  width: 10px;
-  height: 10px;
-  border-radius: 50%;
-  background: #e6b450;
-}
-
 /* Once connected the status steps aside into a small pill and leaves the face visible. */
 .call[data-phase="live"] .center {
   align-items: flex-start;
   justify-content: flex-start;
   padding-top: calc(var(--edge) + env(safe-area-inset-top));
   padding-left: calc(var(--edge) + env(safe-area-inset-left));
+  gap: 8px;
 }
 
 .call[data-phase="live"] .status {
@@ -319,10 +310,58 @@ video.local.off { opacity: 0.35; }
   text-shadow: none;
 }
 
-.call[data-phase="live"] .status::before {
-  display: block;
-  background: #4fd08a;
+/* Link quality: four bars and the words next to them. Bar count and text carry the meaning, colour only helps. */
+.quality {
+  display: none;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  max-width: min(72%, 380px);
+  padding: 8px 14px 8px 12px;
+  border-radius: 18px;
+  background: rgba(15, 14, 12, 0.62);
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+  color: #fff;
+  font-size: 16px;
+  font-weight: 500;
+  line-height: 1.25;
+  text-align: left;
 }
+
+.call[data-phase="live"] .quality { display: flex; }
+
+.quality-bars {
+  display: flex;
+  flex: none;
+  align-items: flex-end;
+  gap: 3px;
+  height: 20px;
+}
+
+.quality-bars i {
+  width: 5px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.28);
+}
+
+.quality-bars i:nth-child(1) { height: 35%; }
+.quality-bars i:nth-child(2) { height: 55%; }
+.quality-bars i:nth-child(3) { height: 78%; }
+.quality-bars i:nth-child(4) { height: 100%; }
+
+.quality { --bar: #6fe0a0; }
+.quality[data-tier="ok"] { --bar: #cfe37a; }
+.quality[data-tier="weak"] { --bar: #ffc65c; }
+.quality[data-tier="very-weak"] { --bar: #ff9a7a; }
+
+.quality[data-bars="1"] i:nth-child(-n + 1),
+.quality[data-bars="2"] i:nth-child(-n + 2),
+.quality[data-bars="3"] i:nth-child(-n + 3),
+.quality[data-bars="4"] i:nth-child(-n + 4) { background: var(--bar); }
+
+.quality-words { display: grid; gap: 2px; }
+.quality-peer { color: rgba(255, 255, 255, 0.78); font-size: 14px; }
 
 .call button.big {
   width: min(100%, 360px);
@@ -369,18 +408,6 @@ video.local.off { opacity: 0.35; }
   left: 50%;
   transform: translate(-50%, -50%);
 }
-
-.upgrade {
-  position: absolute;
-  z-index: 4;
-  left: 50%;
-  bottom: calc(150px + env(safe-area-inset-bottom));
-  transform: translateX(-50%);
-  white-space: nowrap;
-}
-
-.call[data-phase="idle"] .upgrade,
-.call[data-phase="ended"] .upgrade { display: none; }
 
 /* Round buttons along the bottom edge, under the thumb. */
 .controls {
@@ -555,7 +582,6 @@ input[type="password"], input[type="text"] {
     padding-right: calc(110px + env(safe-area-inset-right));
   }
 
-  .upgrade { bottom: calc(16px + env(safe-area-inset-bottom)); }
   .call .lobby-hint { display: none; }
 }
 
@@ -582,6 +608,5 @@ input[type="password"], input[type="text"] {
     border-radius: 18px;
   }
 
-  .upgrade { bottom: 150px; }
-  .call[data-phase="live"] .status { font-size: 17px; }
+  .call[data-phase="live"] .status, .quality { font-size: 17px; }
 }
