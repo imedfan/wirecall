@@ -1,0 +1,12 @@
+# Copy to .dev.vars for local wrangler. Do not commit .dev.vars.
+# Leave TURN disabled unless you intentionally configure Cloudflare Realtime TURN.
+TURN_ENABLED=false
+TURN_KEY_ID=
+TURN_API_TOKEN=
+# Optional. If set, creating a room requires header x-wirecall-gate (the site asks once).
+CREATE_GATE=
+# Optional salt so rate-limit keys are not raw IP addresses.
+LIMIT_HASH_SALT=
+# Comma-separated origins. Empty means same host as the request only.
+ALLOWED_ORIGINS=
+ROOM_TTL_SECONDS=1209600
