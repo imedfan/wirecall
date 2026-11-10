@@ -18,6 +18,7 @@
   --blur: blur(20px) saturate(140%);
   --r-card: 28px;
   --r-preview: 20px;
+  --r-tile: 16px;
   --shadow: 0 18px 50px rgba(0, 0, 0, 0.45);
   --safe-top: env(safe-area-inset-top, 0px);
   --safe-right: env(safe-area-inset-right, 0px);
@@ -309,6 +310,7 @@ h2 { font-size: 22px; font-weight: 600; }
   gap: 16px;
 }
 
+.btn-group { width: min(380px, 100%); padding: 0 20px; font-size: 17px; }
 .result { width: 100%; }
 .problem { min-height: 1.4em; color: var(--warn); font-size: 16px; }
 .problem:empty { display: none; }
@@ -439,6 +441,57 @@ dialog > .btn { width: 100%; margin-top: 20px; }
 
 .call[data-phase="live"] .stage { cursor: pointer; }
 
+/* One other person. Alone it fills the stage; in a conference script gives it a cell of the grid. */
+.tile {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  background: #000;
+}
+
+.stage[data-layout="grid"] .tile {
+  inset: auto;
+  top: 0;
+  left: 0;
+  border-radius: var(--r-tile);
+  background: #0b1216;
+  will-change: transform;
+  transition: transform 0.22s ease, width 0.22s ease, height 0.22s ease;
+}
+
+/* A word about one person's connection, on their own picture. In a call for two the status line says it. */
+.tile-note {
+  display: none;
+  position: absolute;
+  left: 50%;
+  top: 50%;
+  max-width: calc(100% - 16px);
+  padding: 6px 12px;
+  border-radius: 12px;
+  background: rgba(10, 16, 20, 0.62);
+  font-size: 14px;
+  font-weight: 500;
+  text-align: center;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+}
+
+.stage[data-layout="grid"] .tile:not([data-phase="live"]) .tile-note:not(:empty) { display: block; }
+
+/* Their link is weak while the picture still comes: a small label in the corner, out of the face. */
+.stage[data-layout="grid"] .tile[data-weak="true"] .tile-note {
+  display: block;
+  left: 8px;
+  top: auto;
+  bottom: 8px;
+  padding: 4px 9px;
+  font-size: 12px;
+  color: var(--warn);
+  transform: none;
+}
+
+.tile:not([data-phase="live"]) video.remote { opacity: 0.35; }
+
 video.remote {
   position: absolute;
   inset: 0;
@@ -506,7 +559,19 @@ video.local[data-facing="environment"] { transform: none; }
 }
 
 .self.pip::after { display: none; }
+
+/* In a conference the own picture is a tile like the others: it stays in its cell and is not picked up. */
+.self.pip.tiled {
+  /* Level with the other tiles: the badge and the buttons float over all of them. */
+  z-index: 1;
+  border-radius: var(--r-tile);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.22);
+  cursor: default;
+  touch-action: auto;
+  transition: transform 0.22s ease, width 0.22s ease, height 0.22s ease;
+}
 .self.dragging { transition: none; cursor: grabbing; }
+.self.pip.tiled.dragging { transition: none; cursor: default; }
 
 /* ---------- Status and the actions that belong to the current phase ---------- */
 
@@ -874,6 +939,7 @@ video.local[data-facing="environment"] { transform: none; }
 }
 
 .row .chevron { color: var(--muted); font-size: 24px; }
+.row .seats { color: var(--muted); font-size: 16px; font-variant-numeric: tabular-nums; }
 
 .switch i {
   position: relative;

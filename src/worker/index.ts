@@ -1,5 +1,6 @@
 import { authorizeCreate, originAllowed } from "../shared/origin";
 import { isRoomId, shortHash } from "../shared/ids";
+import { capacityOf, type RoomKind } from "../shared/room-state";
 import { logEvent } from "./log";
 import { RoomDurableObject } from "./room-do";
 import { RoomIndexDurableObject } from "./index-do";
@@ -25,7 +26,7 @@ export default {
       return json({ error: "origin" }, 403);
     }
     if (request.method === "POST" && url.pathname === "/api/rooms") {
-      return createRoom(request, env);
+      return createRoom(request, env, url.searchParams.get("kind") === "group" ? "group" : "pair");
     }
     const match = /^\/api\/rooms\/([A-Za-z0-9_-]{22})\/socket$/u.exec(url.pathname);
     if (request.method === "GET" && match?.[1]) {
@@ -36,7 +37,7 @@ export default {
   },
 } satisfies ExportedHandler<Env>;
 
-async function createRoom(request: Request, env: Env): Promise<Response> {
+async function createRoom(request: Request, env: Env, kind: RoomKind): Promise<Response> {
   if (!authorizeCreate(request.headers.get("x-wirecall-gate"), env.CREATE_GATE)) {
     return json({ error: "gate" }, 401);
   }
@@ -45,16 +46,19 @@ async function createRoom(request: Request, env: Env): Promise<Response> {
   const now = Date.now();
   const ttlMs = ttlFromEnv(env);
   const ipHash = await hashIp(request.headers.get("cf-connecting-ip") ?? "unknown", env.LIMIT_HASH_SALT ?? "wirecall-limit-v1");
-  const created = await env.ROOM_INDEX.getByName("index").createRoom(ipHash, now, ttlMs);
+  const created = await env.ROOM_INDEX.getByName("index").createRoom(ipHash, now, ttlMs, kind);
   if (!created.ok) {
     logEvent("room-create-rejected", { code: created.code });
     return json({ error: created.code }, created.code === "rate" || created.code === "daily" ? 429 : 400);
   }
-  logEvent("room-created", { room: await shortHash(created.roomId) });
+  logEvent("room-created", { room: await shortHash(created.roomId), kind });
   return json(
     {
       roomId: created.roomId,
-      path: `/r/${created.roomId}`,
+      // The letter only tells the page which words to show before it joins. The room itself knows its size.
+      path: `/${kind === "group" ? "c" : "r"}/${created.roomId}`,
+      kind,
+      capacity: capacityOf(kind),
       expiresAt: created.expiresAt,
       turn: turnConfigured(env) ? "on" : "off",
     },
@@ -70,7 +74,9 @@ async function openSocket(request: Request, env: Env, roomId: string): Promise<R
   const headers = new Headers(request.headers);
   headers.delete("x-wirecall-expires");
   headers.delete("x-wirecall-room");
+  headers.delete("x-wirecall-capacity");
   headers.set("x-wirecall-expires", String(looked.expiresAt));
+  headers.set("x-wirecall-capacity", String(capacityOf(looked.kind)));
   headers.set("x-wirecall-room", roomId);
   const forwarded = new Request(request.url, { method: request.method, headers });
   logEvent("room-join", { room: await shortHash(roomId) });

@@ -1,9 +1,12 @@
 import { isRoomId } from "./ids";
+import type { RoomKind } from "./room-state";
 
 export interface IndexRoom {
   roomId: string;
   createdAt: number;
   expiresAt: number;
+  /** Absent on rooms made before conferences existed: those are for two. */
+  kind?: RoomKind;
 }
 
 export interface IndexCreateBucket {
@@ -34,6 +37,7 @@ export function createIndexedRoom(
     ipHash: string;
     now: number;
     ttlMs: number;
+    kind?: RoomKind;
     perIpLimit: number;
     perIpWindowMs: number;
     dailyLimit: number;
@@ -57,7 +61,9 @@ export function createIndexedRoom(
   else creates.push({ ipHash: input.ipHash, windowStart: input.now, count: 1 });
   const expiresAt = input.now + input.ttlMs;
   const rooms = purged.rooms.filter((room) => room.roomId !== input.roomId);
-  rooms.push({ roomId: input.roomId, createdAt: input.now, expiresAt });
+  const room: IndexRoom = { roomId: input.roomId, createdAt: input.now, expiresAt };
+  if (input.kind === "group") room.kind = "group";
+  rooms.push(room);
   return {
     ok: true,
     roomId: input.roomId,

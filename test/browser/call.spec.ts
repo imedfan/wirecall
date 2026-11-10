@@ -17,7 +17,7 @@ async function launch(): Promise<Browser> {
 /** Creates a room on the home page and returns its path. The full address lives only in the link itself. */
 async function createRoom(page: Page): Promise<string> {
   await page.goto("/");
-  await page.getByRole("button", { name: "Создать ссылку" }).click();
+  await page.getByRole("button", { name: "Создать ссылку", exact: true }).click();
   const path = await page.getByRole("link", { name: "Открыть звонок" }).getAttribute("href");
   expect(path).toMatch(/^\/r\//u);
   return path!;
@@ -26,8 +26,10 @@ async function createRoom(page: Page): Promise<string> {
 test("the home page has one main button and a drifting background that stands still on request", async ({ browser }) => {
   const page = await browser.newPage();
   await page.goto("/");
-  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Звонок для двоих");
+  await expect(page.getByRole("heading", { level: 1 })).toHaveText("Звонок по ссылке");
   await expect(page.locator(".home .btn-primary")).toHaveCount(1);
+  // The conference button is there, and it is the quieter of the two.
+  await expect(page.getByRole("button", { name: "Создать ссылку для конференции" })).toHaveClass(/btn-glass/u);
   await expect(page.getByRole("button", { name: "Подробнее" })).toBeVisible();
   // The technical notes are not on the page itself.
   expect(await page.locator(".home").innerText()).not.toMatch(/TURN|STUN|Cloudflare/u);
@@ -339,6 +341,8 @@ async function press(page: Page, name: string): Promise<void> {
 }
 
 interface ProbeState {
+  /** The other person in a call for two, as the room named them. */
+  peer: string;
   pcs: (RTCPeerConnection & { __force: (state: string | null) => void })[];
   sockets: WebSocket[];
   sent: { type: string; kind?: string; gen?: number; ack?: boolean }[];
@@ -358,7 +362,7 @@ interface Probe {
 /** Records what the page does with sockets, connections and devices, and lets a test fake an ICE failure. */
 async function arm(page: Page): Promise<void> {
   await page.addInitScript(() => {
-    const state: ProbeState = { pcs: [], sockets: [], sent: [], received: [], lastOffer: "", gen: -1, media: 0, streams: [], statuses: [], mark: 0 };
+    const state: ProbeState = { peer: "", pcs: [], sockets: [], sent: [], received: [], lastOffer: "", gen: -1, media: 0, streams: [], statuses: [], mark: 0 };
     (window as unknown as Probe).__wc = state;
 
     const OriginalSocket = WebSocket;
@@ -373,9 +377,14 @@ async function arm(page: Page): Promise<void> {
         send(data);
       };
       socket.addEventListener("message", (event) => {
-        const message = JSON.parse(String(event.data)) as { type: string; kind?: string; gen?: number; ack?: boolean };
-        state.received.push({ type: message.type, kind: message.kind, gen: message.gen, ack: message.ack });
-        if (typeof message.gen === "number" && message.type !== "signal" && message.type !== "restart") state.gen = message.gen;
+        const message = JSON.parse(String(event.data)) as { type: string; kind?: string; gen?: number; ack?: boolean; peerId?: string; peers?: { peerId: string; gen: number }[] };
+        // A welcome names the connections one by one. In a call for two there is at most one.
+        const listed = message.type === "welcome" ? message.peers?.[0] : undefined;
+        const gen = listed ? listed.gen : message.gen;
+        state.received.push({ type: message.type, kind: message.kind, gen, ack: message.ack });
+        if (listed) state.peer = listed.peerId;
+        else if (message.type !== "welcome" && message.type !== "peer-left" && message.peerId) state.peer = message.peerId;
+        if (typeof gen === "number" && message.type !== "signal" && message.type !== "restart") state.gen = gen;
       });
       return socket;
     } as unknown as typeof WebSocket;
@@ -449,8 +458,8 @@ async function snapshot(page: Page) {
   return page.evaluate(() => {
     const state = (window as unknown as Probe).__wc;
     const pc = state.pcs[state.pcs.length - 1];
-    const video = document.querySelector("video.remote") as HTMLVideoElement;
-    const stream = video.srcObject instanceof MediaStream ? video.srcObject : null;
+    const video = document.querySelector("video.remote") as HTMLVideoElement | null;
+    const stream = video?.srcObject instanceof MediaStream ? video.srcObject : null;
     const senders = pc?.connectionState === "closed" ? [] : (pc?.getSenders() ?? []);
     const count = (list: ProbeState["sent"], type: string, kind?: string) => list.filter((item) => item.type === type && (kind === undefined || item.kind === kind)).length;
     return {
@@ -491,20 +500,22 @@ async function dropSocket(page: Page): Promise<void> {
   expect(closed).toBe(true);
 }
 
-/** Sends a message to the room as the page would. */
+/** Sends a message to the room as the page would, addressed to the other person. */
 async function sendRaw(page: Page, message: object): Promise<void> {
-  await page.evaluate((text) => {
-    const open = (window as unknown as Probe).__wc.sockets.filter((socket) => socket.readyState === WebSocket.OPEN);
-    open[open.length - 1]?.send(text);
-  }, JSON.stringify(message));
+  await page.evaluate((body) => {
+    const state = (window as unknown as Probe).__wc;
+    const open = state.sockets.filter((socket) => socket.readyState === WebSocket.OPEN);
+    open[open.length - 1]?.send(JSON.stringify({ ...body, to: state.peer }));
+  }, message);
 }
 
-/** Hands the page a message as if the room had sent it. */
+/** Hands the page a message as if the room had passed it on from the other person. */
 async function deliverRaw(page: Page, message: object): Promise<void> {
-  await page.evaluate((text) => {
-    const open = (window as unknown as Probe).__wc.sockets.filter((socket) => socket.readyState === WebSocket.OPEN);
-    open[open.length - 1]?.dispatchEvent(new MessageEvent("message", { data: text }));
-  }, JSON.stringify(message));
+  await page.evaluate((body) => {
+    const state = (window as unknown as Probe).__wc;
+    const open = state.sockets.filter((socket) => socket.readyState === WebSocket.OPEN);
+    open[open.length - 1]?.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({ ...body, from: state.peer }) }));
+  }, message);
 }
 
 async function forceIce(page: Page, state: string): Promise<void> {
@@ -535,6 +546,83 @@ async function framesAdvance(page: Page): Promise<void> {
   await expect.poll(frames, { timeout: 10_000 }).toBeGreaterThan(start + 5);
 }
 
+test("a conference connects three people in a grid, keeps going when one leaves, and refuses nobody below its size", async () => {
+  test.setTimeout(120_000);
+  const browser = await launch();
+  const pages = [await browser.newPage(), await browser.newPage(), await browser.newPage()];
+  for (const page of pages) await arm(page);
+  const [first, second, third] = pages as [Page, Page, Page];
+  await first.goto("/");
+  await first.getByRole("button", { name: "Создать ссылку для конференции" }).click();
+  await expect(first.locator(".link-card")).toContainText("До 6 человек");
+  const path = await first.getByRole("link", { name: "Открыть конференцию" }).getAttribute("href");
+  expect(path).toMatch(/^\/c\//u);
+  for (const page of pages) await page.goto(path!);
+  // The lobby says what this link is before anything is asked of the person.
+  await expect(first.locator(".status")).toHaveText("Конференция");
+  await expect(first.locator(".status-note")).toHaveText("До 6 человек");
+  await first.getByRole("button", { name: "Войти в конференцию" }).click();
+  await expect(first.locator(".status")).toHaveText("Ждём участников");
+  await second.getByRole("button", { name: "Войти в конференцию" }).click();
+  await expectLive(first, 25_000);
+  await expectLive(second, 25_000);
+  // Two people in a conference look like a call for two: one picture, the own one in a window.
+  await expect(first.locator(".stage")).toHaveAttribute("data-layout", "single");
+  const pair = { first: await snapshot(first), second: await snapshot(second) };
+
+  await third.getByRole("button", { name: "Войти в конференцию" }).click();
+  for (const page of pages) {
+    await expectLive(page, 25_000);
+    await expect(page.locator(".stage")).toHaveAttribute("data-layout", "grid");
+    await expect(page.locator('.tile[data-phase="live"]')).toHaveCount(2, { timeout: 25_000 });
+    // Both other people are seen, not just connected.
+    await expect.poll(async () => page.locator("video.remote").evaluateAll((nodes) => nodes.every((node) => (node as HTMLVideoElement).videoWidth > 0)), { timeout: 20_000 }).toBe(true);
+    await expect(page.locator(".self")).toHaveClass(/tiled/u);
+  }
+  // The newcomer cost the first two nothing: their connection to each other is the one they had.
+  const joined = { first: await snapshot(first), second: await snapshot(second) };
+  expect(joined.first.pcs).toBe(pair.first.pcs + 1);
+  expect(joined.second.pcs).toBe(pair.second.pcs + 1);
+  expect(joined.first.rebuilds).toBe(pair.first.rebuilds);
+  const firstPcs = await first.evaluate(() => (window as unknown as Probe).__wc.pcs.map((pc) => pc.connectionState));
+  expect(firstPcs).toEqual(["connected", "connected"]);
+  // The three tiles and the own one share the screen without overlapping.
+  const boxes = await first.locator(".tile, .self").evaluateAll((nodes) => nodes.map((node) => node.getBoundingClientRect()).map((box) => ({ x: box.x, y: box.y, right: box.right, bottom: box.bottom })));
+  expect(boxes).toHaveLength(3);
+  for (let i = 0; i < boxes.length; i += 1) {
+    for (let j = i + 1; j < boxes.length; j += 1) {
+      const a = boxes[i]!;
+      const b = boxes[j]!;
+      expect(a.x < b.right - 1 && b.x < a.right - 1 && a.y < b.bottom - 1 && b.y < a.bottom - 1).toBe(false);
+    }
+  }
+  // Each outgoing video gets a smaller share of the uplink than in a call for two.
+  await expect.poll(async () => first.evaluate(() => (window as unknown as Probe).__wc.pcs.map((pc) => pc.getSenders().find((sender) => sender.track?.kind === "video")?.getParameters().encodings[0]?.maxBitrate))).toEqual([600_000, 600_000]);
+  // The settings sheet offers the link and says how many seats are taken.
+  await press(first, "Настройки");
+  await expect(first.getByRole("button", { name: /Пригласить по ссылке/u })).toContainText("3 из 6");
+  await first.keyboard.press("Escape");
+  await first.screenshot({ path: `${artifacts}/wirecall-conference.png` });
+
+  // One person leaves. The other two go on, on the same connection, back in the layout for two.
+  await press(third, "Завершить");
+  await expect(third.locator(".status")).toHaveText("Звонок завершён");
+  for (const page of [first, second]) {
+    await expect(page.locator(".tile")).toHaveCount(1);
+    await expect(page.locator(".stage")).toHaveAttribute("data-layout", "single");
+    await expectLive(page);
+    await framesAdvance(page);
+  }
+  const after = await snapshot(first);
+  expect(after.pcs).toBe(joined.first.pcs);
+  expect(after.rebuilds).toBe(joined.first.rebuilds);
+  await expect.poll(async () => first.evaluate(() => (window as unknown as Probe).__wc.pcs[0]!.getSenders().find((sender) => sender.track?.kind === "video")?.getParameters().encodings[0]?.maxBitrate)).toBe(1_200_000);
+  // And the one who left can come back.
+  await third.getByRole("button", { name: "Войти снова" }).click();
+  for (const page of pages) await expect(page.locator('.tile[data-phase="live"]')).toHaveCount(2, { timeout: 25_000 });
+  await browser.close();
+});
+
 test("permission failure shows recovery guidance", async () => {
   const browser = await chromium.launch({ args: ["--deny-permission-prompts"] });
   const page = await browser.newPage();
@@ -553,6 +641,12 @@ test("signaling socket rejects an unknown room and a cross-site origin", async (
   expect(missing.status()).toBe(404);
   const created = await request.post("/api/rooms", { headers: { origin: "http://127.0.0.1:8787" } });
   expect(created.status()).toBe(201);
+  expect(await created.json()).toMatchObject({ kind: "pair", capacity: 2 });
+  const conference = await request.post("/api/rooms?kind=group", { headers: { origin: "http://127.0.0.1:8787" } });
+  expect(conference.status()).toBe(201);
+  const body = (await conference.json()) as { path: string; kind: string; capacity: number };
+  expect(body).toMatchObject({ kind: "group", capacity: 6 });
+  expect(body.path).toMatch(/^\/c\//u);
   const foreign = await request.post("/api/rooms", { headers: { origin: "https://evil.example" } });
   expect(foreign.status()).toBe(403);
 });

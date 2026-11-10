@@ -13,24 +13,33 @@ import { isRoomId } from "../../src/shared/ids";
 
 describe("signaling validation", () => {
   it("accepts a bounded hello and signal and drops cross-room fields", () => {
-    const hello = parseClientMessage(JSON.stringify({ type: "hello", protocol: 2, roomId: "other-room", resume: "short" }));
+    const peer = "3f2c1a9e-7b4d-4c1e-9a52-0d6e8b7f1c23";
+    const hello = parseClientMessage(JSON.stringify({ type: "hello", protocol: 3, roomId: "other-room", resume: "short" }));
     expect(hello.ok).toBe(false);
     const token = "A".repeat(43);
-    const ok = parseClientMessage(JSON.stringify({ type: "hello", protocol: 2, roomId: "other-room", resume: token, gen: 3 }));
-    expect(ok).toEqual({ ok: true, message: { type: "hello", protocol: 2, resume: token, gen: 3 } });
-    // A page from before generations existed must not join a newer call.
-    expect(parseClientMessage(JSON.stringify({ type: "hello", protocol: 1 }))).toEqual({ ok: false, code: "bad-protocol" });
-    const offer = parseClientMessage(JSON.stringify({ type: "signal", kind: "offer", payload: "v=0\r\noffer", gen: 4, targetRoom: "nope" }));
+    const ok = parseClientMessage(JSON.stringify({ type: "hello", protocol: 3, roomId: "other-room", resume: token, keep: [{ peerId: peer, gen: 3, extra: 1 }] }));
+    expect(ok).toEqual({ ok: true, message: { type: "hello", protocol: 3, resume: token, keep: [{ peerId: peer, gen: 3 }] } });
+    // A page of the two-person protocol must not join a newer call.
+    expect(parseClientMessage(JSON.stringify({ type: "hello", protocol: 2 }))).toEqual({ ok: false, code: "bad-protocol" });
+    // A hello cannot name more connections than any room has, nor a peer that is not an id.
+    expect(parseClientMessage(JSON.stringify({ type: "hello", protocol: 3, keep: Array.from({ length: 17 }, () => ({ peerId: peer, gen: 1 })) })).ok).toBe(false);
+    expect(parseClientMessage(JSON.stringify({ type: "hello", protocol: 3, keep: [{ peerId: "everyone", gen: 1 }] })).ok).toBe(false);
+    const offer = parseClientMessage(JSON.stringify({ type: "signal", to: peer, kind: "offer", payload: "v=0\r\noffer", gen: 4, targetRoom: "nope" }));
     expect(offer.ok).toBe(true);
-    if (offer.ok) expect(offer.message).toEqual({ type: "signal", kind: "offer", payload: "v=0\r\noffer", gen: 4 });
-    expect(parseClientMessage(JSON.stringify({ type: "signal", kind: "offer", payload: "v=0\r\noffer" })).ok).toBe(false);
-    expect(parseClientMessage(JSON.stringify({ type: "signal", kind: "offer", payload: "v=0\r\noffer", gen: -1 })).ok).toBe(false);
-    expect(parseClientMessage(JSON.stringify({ type: "signal", kind: "offer", payload: "not-sdp", gen: 4 })).ok).toBe(false);
-    expect(parseClientMessage(JSON.stringify({ type: "restart", gen: 4, ack: false }))).toEqual({ ok: true, message: { type: "restart", gen: 4, ack: false } });
-    expect(parseClientMessage(JSON.stringify({ type: "restart", gen: 4 })).ok).toBe(false);
-    expect(parseClientMessage(JSON.stringify({ type: "rebuild", gen: 4 }))).toEqual({ ok: true, message: { type: "rebuild", gen: 4 } });
-    expect(parseClientMessage(JSON.stringify({ type: "rebuild", gen: 1.5 })).ok).toBe(false);
-    expect(parseClientMessage(`{"type":"signal","kind":"offer","payload":"${"v=".padEnd(40_000, "a")}"}`).ok).toBe(false);
+    if (offer.ok) expect(offer.message).toEqual({ type: "signal", to: peer, kind: "offer", payload: "v=0\r\noffer", gen: 4 });
+    // Every signal is addressed to one peer.
+    expect(parseClientMessage(JSON.stringify({ type: "signal", kind: "offer", payload: "v=0\r\noffer", gen: 4 })).ok).toBe(false);
+    expect(parseClientMessage(JSON.stringify({ type: "signal", to: "*", kind: "offer", payload: "v=0\r\noffer", gen: 4 })).ok).toBe(false);
+    expect(parseClientMessage(JSON.stringify({ type: "signal", to: peer, kind: "offer", payload: "v=0\r\noffer" })).ok).toBe(false);
+    expect(parseClientMessage(JSON.stringify({ type: "signal", to: peer, kind: "offer", payload: "v=0\r\noffer", gen: -1 })).ok).toBe(false);
+    expect(parseClientMessage(JSON.stringify({ type: "signal", to: peer, kind: "offer", payload: "not-sdp", gen: 4 })).ok).toBe(false);
+    expect(parseClientMessage(JSON.stringify({ type: "restart", to: peer, gen: 4, ack: false }))).toEqual({ ok: true, message: { type: "restart", to: peer, gen: 4, ack: false } });
+    expect(parseClientMessage(JSON.stringify({ type: "restart", to: peer, gen: 4 })).ok).toBe(false);
+    expect(parseClientMessage(JSON.stringify({ type: "restart", gen: 4, ack: true })).ok).toBe(false);
+    expect(parseClientMessage(JSON.stringify({ type: "rebuild", to: peer, gen: 4 }))).toEqual({ ok: true, message: { type: "rebuild", to: peer, gen: 4 } });
+    expect(parseClientMessage(JSON.stringify({ type: "rebuild", to: peer, gen: 1.5 })).ok).toBe(false);
+    expect(parseClientMessage(JSON.stringify({ type: "rebuild", gen: 4 })).ok).toBe(false);
+    expect(parseClientMessage(`{"type":"signal","to":"${peer}","kind":"offer","payload":"${"v=".padEnd(40_000, "a")}","gen":1}`).ok).toBe(false);
   });
 
   it("checks origin, create gate, and log redaction", () => {
@@ -111,7 +120,7 @@ describe("signaling validation", () => {
     expect(summary.lossRatio).toBeUndefined();
     expect(summary.bitrate).toBe(8000);
     const ice = encodeIcePayload({ candidate: "candidate:1 1 UDP 1 127.0.0.1 9 typ host", sdpMid: "0", sdpMLineIndex: 0 });
-    const parsed = parseClientMessage(JSON.stringify({ type: "signal", kind: "ice", payload: ice, gen: 0 }));
+    const parsed = parseClientMessage(JSON.stringify({ type: "signal", to: "3f2c1a9e-7b4d-4c1e-9a52-0d6e8b7f1c23", kind: "ice", payload: ice, gen: 0 }));
     expect(parsed.ok).toBe(true);
   });
 });

@@ -138,7 +138,7 @@ function video(): HTMLVideoElement {
 }
 
 function session(): CallSession {
-  return new CallSession("room", video(), video(), {
+  return new CallSession("room", video(), {
     onStatus: (text) => statuses.push(text),
     onDiagnostics: () => undefined,
     onAudioBlocked: () => undefined,
@@ -160,7 +160,7 @@ describe("call session mute and hangup", () => {
   it("does not re-enable a muted mic or camera after a camera switch or foreground reacquire", async () => {
     install();
     const local = video();
-    const call = new CallSession("room", local, video(), {
+    const call = new CallSession("room", local, {
       onStatus: (text) => statuses.push(text),
       onDiagnostics: () => undefined,
       onAudioBlocked: () => undefined,
