@@ -13,15 +13,23 @@ import { isRoomId } from "../../src/shared/ids";
 
 describe("signaling validation", () => {
   it("accepts a bounded hello and signal and drops cross-room fields", () => {
-    const hello = parseClientMessage(JSON.stringify({ type: "hello", protocol: 1, roomId: "other-room", resume: "short" }));
+    const hello = parseClientMessage(JSON.stringify({ type: "hello", protocol: 2, roomId: "other-room", resume: "short" }));
     expect(hello.ok).toBe(false);
     const token = "A".repeat(43);
-    const ok = parseClientMessage(JSON.stringify({ type: "hello", protocol: 1, roomId: "other-room", resume: token }));
-    expect(ok).toEqual({ ok: true, message: { type: "hello", protocol: 1, resume: token } });
-    const offer = parseClientMessage(JSON.stringify({ type: "signal", kind: "offer", payload: "v=0\r\noffer", targetRoom: "nope" }));
+    const ok = parseClientMessage(JSON.stringify({ type: "hello", protocol: 2, roomId: "other-room", resume: token, gen: 3 }));
+    expect(ok).toEqual({ ok: true, message: { type: "hello", protocol: 2, resume: token, gen: 3 } });
+    // A page from before generations existed must not join a newer call.
+    expect(parseClientMessage(JSON.stringify({ type: "hello", protocol: 1 }))).toEqual({ ok: false, code: "bad-protocol" });
+    const offer = parseClientMessage(JSON.stringify({ type: "signal", kind: "offer", payload: "v=0\r\noffer", gen: 4, targetRoom: "nope" }));
     expect(offer.ok).toBe(true);
-    if (offer.ok) expect(offer.message).toEqual({ type: "signal", kind: "offer", payload: "v=0\r\noffer" });
-    expect(parseClientMessage(JSON.stringify({ type: "signal", kind: "offer", payload: "not-sdp" })).ok).toBe(false);
+    if (offer.ok) expect(offer.message).toEqual({ type: "signal", kind: "offer", payload: "v=0\r\noffer", gen: 4 });
+    expect(parseClientMessage(JSON.stringify({ type: "signal", kind: "offer", payload: "v=0\r\noffer" })).ok).toBe(false);
+    expect(parseClientMessage(JSON.stringify({ type: "signal", kind: "offer", payload: "v=0\r\noffer", gen: -1 })).ok).toBe(false);
+    expect(parseClientMessage(JSON.stringify({ type: "signal", kind: "offer", payload: "not-sdp", gen: 4 })).ok).toBe(false);
+    expect(parseClientMessage(JSON.stringify({ type: "restart", gen: 4, ack: false }))).toEqual({ ok: true, message: { type: "restart", gen: 4, ack: false } });
+    expect(parseClientMessage(JSON.stringify({ type: "restart", gen: 4 })).ok).toBe(false);
+    expect(parseClientMessage(JSON.stringify({ type: "rebuild", gen: 4 }))).toEqual({ ok: true, message: { type: "rebuild", gen: 4 } });
+    expect(parseClientMessage(JSON.stringify({ type: "rebuild", gen: 1.5 })).ok).toBe(false);
     expect(parseClientMessage(`{"type":"signal","kind":"offer","payload":"${"v=".padEnd(40_000, "a")}"}`).ok).toBe(false);
   });
 
@@ -99,7 +107,7 @@ describe("signaling validation", () => {
     expect(summary.lossRatio).toBeUndefined();
     expect(summary.bitrate).toBe(8000);
     const ice = encodeIcePayload({ candidate: "candidate:1 1 UDP 1 127.0.0.1 9 typ host", sdpMid: "0", sdpMLineIndex: 0 });
-    const parsed = parseClientMessage(JSON.stringify({ type: "signal", kind: "ice", payload: ice }));
+    const parsed = parseClientMessage(JSON.stringify({ type: "signal", kind: "ice", payload: ice, gen: 0 }));
     expect(parsed.ok).toBe(true);
   });
 });

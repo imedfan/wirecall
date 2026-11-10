@@ -5,7 +5,6 @@ export const MAX_PEERS = 2;
 export const STALE_PEER_MS = 90_000;
 export const JOIN_WINDOW_MS = 10 * 60 * 1000;
 export const JOIN_LIMIT = 240;
-export const MAX_ICE_PER_PEER = 20;
 
 export interface PeerRecord {
   peerId: string;
@@ -28,6 +27,11 @@ export interface RoomState {
   queued: QueuedSignal[];
   joinWindowStart: number;
   joinCount: number;
+  /**
+   * Generation of the media connection both peers share. It grows whenever the two must start a new
+   * RTCPeerConnection. Signals carry it, so nothing from an older connection reaches a newer one.
+   */
+  gen: number;
 }
 
 export function newRoom(now: number, ttlMs: number): RoomState {
@@ -38,6 +42,7 @@ export function newRoom(now: number, ttlMs: number): RoomState {
     queued: [],
     joinWindowStart: now,
     joinCount: 0,
+    gen: 0,
   };
 }
 
@@ -51,7 +56,10 @@ export type AdmitResult =
       peerCount: number;
       expiresAt: number;
       flush: QueuedSignal[];
-      notify: "joined" | "reset" | "none";
+      notify: "joined" | "back" | "none";
+      gen: number;
+      /** The resumed peer still holds the connection of this generation, so nobody rebuilds. */
+      kept: boolean;
     }
   | { ok: false; state: RoomState; code: "expired" | "rate" | "room-full" };
 
@@ -64,6 +72,8 @@ export function admitPeer(
     newPeerId: string;
     newResumeHash: string;
     livePeerIds: readonly string[];
+    /** Generation of the connection the client still holds, if any. */
+    keepGen?: number | null;
   },
 ): AdmitResult {
   if (input.now >= state.expiresAt) return { ok: false, state, code: "expired" };
@@ -74,8 +84,12 @@ export function admitPeer(
     ? next.peers.find((peer) => timingSafeEqualString(peer.resumeHash, input.resumeHash ?? ""))
     : undefined;
   if (existing) {
+    // A signaling drop alone must not cost a working call. Only a peer that lost its connection forces a new one.
+    const kept = input.keepGen !== null && input.keepGen !== undefined && input.keepGen === next.gen;
     next = {
       ...next,
+      gen: kept ? next.gen : next.gen + 1,
+      queued: [],
       peers: next.peers.map((peer) => (peer.peerId === existing.peerId ? { ...peer, resumeHash: input.newResumeHash, lastSeen: input.now } : peer)),
     };
     return {
@@ -86,8 +100,10 @@ export function admitPeer(
       resumed: true,
       peerCount: next.peers.length,
       expiresAt: next.expiresAt,
-      flush: next.queued.filter((signal) => signal.fromPeerId !== existing.peerId),
-      notify: "reset",
+      flush: [],
+      notify: next.peers.length === 2 ? "back" : "none",
+      gen: next.gen,
+      kept,
     };
   }
   if (next.peers.length >= MAX_PEERS) return { ok: false, state: next, code: "room-full" };
@@ -101,7 +117,7 @@ export function admitPeer(
     lastSeen: input.now,
   };
   // Signals queued before this join belong to a connection the newcomer never saw. Replaying them breaks the fresh one.
-  next = { ...next, peers: [...next.peers, peer], queued: [] };
+  next = { ...next, peers: [...next.peers, peer], queued: [], gen: next.gen + 1 };
   return {
     ok: true,
     state: next,
@@ -112,21 +128,34 @@ export function admitPeer(
     expiresAt: next.expiresAt,
     flush: [],
     notify: next.peers.length === 2 ? "joined" : "none",
+    gen: next.gen,
+    kept: false,
   };
 }
 
 export function relaySignal(
   state: RoomState,
-  input: { now: number; ttlMs: number; fromPeerId: string; kind: SignalKind; payload: string; livePeerIds: readonly string[] },
-): { ok: true; state: RoomState; toPeerIds: string[] } | { ok: false; state: RoomState; code: "unknown-peer" | "expired" } {
+  input: { now: number; ttlMs: number; fromPeerId: string; kind: SignalKind; payload: string; livePeerIds: readonly string[]; gen?: number },
+): { ok: true; state: RoomState; toPeerIds: string[]; stale: boolean } | { ok: false; state: RoomState; code: "unknown-peer" | "expired" } {
   if (input.now >= state.expiresAt) return { ok: false, state, code: "expired" };
   const swept = sweepStale(state, input.now, input.livePeerIds);
   const sender = swept.peers.find((peer) => peer.peerId === input.fromPeerId);
   if (!sender) return { ok: false, state: swept, code: "unknown-peer" };
   const peers = swept.peers.map((peer) => (peer.peerId === sender.peerId ? { ...peer, lastSeen: input.now } : peer));
-  const queued = enqueueSignal(swept.queued, { fromPeerId: sender.peerId, kind: input.kind, payload: input.payload });
-  const next = extendExpiry({ ...swept, peers, queued }, input.now, input.ttlMs);
-  return { ok: true, state: next, toPeerIds: peers.filter((peer) => peer.peerId !== sender.peerId).map((peer) => peer.peerId) };
+  // Nothing is stored for later. A peer that was away asks for a fresh offer when it returns.
+  const next = extendExpiry({ ...swept, peers, queued: [] }, input.now, input.ttlMs);
+  // A signal of another generation belongs to a connection that no longer exists on the other side.
+  if (input.gen !== undefined && input.gen !== next.gen) return { ok: true, state: next, toPeerIds: [], stale: true };
+  return { ok: true, state: next, toPeerIds: peers.filter((peer) => peer.peerId !== sender.peerId).map((peer) => peer.peerId), stale: false };
+}
+
+/**
+ * Starts a new generation when a peer reports that restarts did not bring the media back.
+ * Two peers that ask at the same moment name the same generation, so the room rebuilds once.
+ */
+export function rebuildRoom(state: RoomState, gen: number): { state: RoomState; bumped: boolean } {
+  if (gen !== state.gen) return { state, bumped: false };
+  return { state: { ...state, gen: state.gen + 1, queued: [] }, bumped: true };
 }
 
 export function leavePeer(state: RoomState, peerId: string): { state: RoomState; removed: boolean; peerCount: number } {
@@ -172,19 +201,4 @@ function sweepStale(state: RoomState, now: number, livePeerIds: readonly string[
 
 function extendExpiry(state: RoomState, now: number, ttlMs: number): RoomState {
   return { ...state, expiresAt: Math.max(state.expiresAt, now + ttlMs) };
-}
-
-function enqueueSignal(queued: readonly QueuedSignal[], signal: QueuedSignal): QueuedSignal[] {
-  if (signal.kind === "offer") {
-    const kept = queued.filter((entry) => entry.fromPeerId !== signal.fromPeerId);
-    return [...kept, signal];
-  }
-  if (signal.kind === "answer") {
-    const kept = queued.filter((entry) => !(entry.fromPeerId === signal.fromPeerId && entry.kind === "answer"));
-    return [...kept, signal];
-  }
-  const ice = queued.filter((entry) => entry.fromPeerId === signal.fromPeerId && entry.kind === "ice");
-  const others = queued.filter((entry) => !(entry.fromPeerId === signal.fromPeerId && entry.kind === "ice"));
-  const nextIce = [...ice, signal].slice(-MAX_ICE_PER_PEER);
-  return [...others, ...nextIce];
 }
