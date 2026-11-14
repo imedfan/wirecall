@@ -10,6 +10,14 @@ export const PAIR_CAPACITY = 2;
  */
 export const GROUP_CAPACITY = 6;
 export const STALE_PEER_MS = 90_000;
+/**
+ * A full room gives the seat of someone whose socket has been gone this long to a newcomer. It is nearly always
+ * the same person: the tab was killed, or the link was opened again from the messenger, and the resume token
+ * stayed in the old tab. Shorter than the sweep, longer than a socket takes to come back after a network change.
+ */
+export const EVICT_AWAY_MS = 15_000;
+/** A seat's last-seen time is saved again only when it moved this far. Every ping and signal moves it a little. */
+const SEEN_SAVE_STEP_MS = 30_000;
 export const JOIN_WINDOW_MS = 10 * 60 * 1000;
 export const JOIN_LIMIT = 240;
 
@@ -86,8 +94,10 @@ export type AdmitResult =
       expiresAt: number;
       /** Every other peer in the room, with the connection the admitted one has or must build to it. */
       links: AdmittedLink[];
+      /** Seats this admission emptied: stale ones, and one given up to the newcomer. The others must be told. */
+      removedPeerIds: string[];
     }
-  | { ok: false; state: RoomState; code: "expired" | "rate" | "room-full" };
+  | { ok: false; state: RoomState; code: "expired" | "rate" | "room-full"; removedPeerIds: string[] };
 
 export function admitPeer(
   state: RoomState,
@@ -103,9 +113,11 @@ export function admitPeer(
     keep?: readonly KeptLink[] | null;
   },
 ): AdmitResult {
-  if (input.now >= state.expiresAt) return { ok: false, state, code: "expired" };
+  if (input.now >= state.expiresAt) return { ok: false, state, code: "expired", removedPeerIds: [] };
   const rated = noteJoin(sweepStale(state, input.now, input.livePeerIds), input.now);
-  if (!rated.ok) return { ok: false, state: rated.state, code: "rate" };
+  const removed = (after: RoomState): string[] =>
+    state.peers.filter((peer) => !after.peers.some((kept) => kept.peerId === peer.peerId)).map((peer) => peer.peerId);
+  if (!rated.ok) return { ok: false, state: rated.state, code: "rate", removedPeerIds: removed(rated.state) };
   let next = extendExpiry(rated.state, input.now, input.ttlMs);
   const existing = input.resumeHash
     ? next.peers.find((peer) => timingSafeEqualString(peer.resumeHash, input.resumeHash ?? ""))
@@ -139,9 +151,14 @@ export function admitPeer(
       peerCount: next.peers.length,
       expiresAt: next.expiresAt,
       links: admitted,
+      removedPeerIds: removed(next),
     };
   }
-  if (next.peers.length >= (input.capacity ?? PAIR_CAPACITY)) return { ok: false, state: next, code: "room-full" };
+  if (next.peers.length >= (input.capacity ?? PAIR_CAPACITY)) {
+    const away = longestAway(next, input.now, input.livePeerIds);
+    if (!away) return { ok: false, state: next, code: "room-full", removedPeerIds: removed(next) };
+    next = withLinksOf({ ...next, peers: next.peers.filter((peer) => peer.peerId !== away.peerId) });
+  }
   // The newcomer came last, so it answers on every link and those who were here first offer.
   const gen = next.gen + 1;
   const peer: PeerRecord = {
@@ -165,7 +182,33 @@ export function admitPeer(
     peerCount: next.peers.length,
     expiresAt: next.expiresAt,
     links: admitted,
+    removedPeerIds: removed(next),
   };
+}
+
+/** The socket of this peer has just closed. From this moment its seat counts as away. */
+export function seenPeer(state: RoomState, peerId: string, now: number): RoomState {
+  return { ...state, peers: state.peers.map((peer) => (peer.peerId === peerId ? { ...peer, lastSeen: now } : peer)) };
+}
+
+/**
+ * Whether a newer state differs from the saved one enough to be written. Seats, links and the join counter
+ * always are. Times that only crept forward are not: a write holds back every message the room sends until it
+ * is durable, and a call sets up through dozens of small signals.
+ */
+export function worthSaving(saved: RoomState | null, next: RoomState, ttlMs: number): boolean {
+  if (!saved) return true;
+  if (saved.gen !== next.gen || saved.joinCount !== next.joinCount || saved.joinWindowStart !== next.joinWindowStart) return true;
+  if (saved.peers.length !== next.peers.length) return true;
+  for (let index = 0; index < next.peers.length; index += 1) {
+    const before = saved.peers[index]!;
+    const after = next.peers[index]!;
+    if (before.peerId !== after.peerId || before.resumeHash !== after.resumeHash) return true;
+    if (after.lastSeen - before.lastSeen >= SEEN_SAVE_STEP_MS) return true;
+  }
+  const keys = Object.keys(next.links);
+  if (keys.length !== Object.keys(saved.links).length || keys.some((key) => saved.links[key] !== next.links[key])) return true;
+  return next.expiresAt - saved.expiresAt >= Math.min(3_600_000, ttlMs / 10);
 }
 
 export function relaySignal(
@@ -226,6 +269,16 @@ function noteJoin(state: RoomState, now: number): { ok: boolean; state: RoomStat
   const joinCount = fresh ? 0 : state.joinCount;
   if (joinCount >= JOIN_LIMIT) return { ok: false, state: { ...state, joinWindowStart, joinCount } };
   return { ok: true, state: { ...state, joinWindowStart, joinCount: joinCount + 1 } };
+}
+
+/** The seat without a socket that has been empty longest, if it has been empty long enough to give away. */
+function longestAway(state: RoomState, now: number, livePeerIds: readonly string[]): PeerRecord | null {
+  let found: PeerRecord | null = null;
+  for (const peer of state.peers) {
+    if (livePeerIds.includes(peer.peerId) || now - peer.lastSeen < EVICT_AWAY_MS) continue;
+    if (!found || peer.lastSeen < found.lastSeen) found = peer;
+  }
+  return found;
 }
 
 function sweepStale(state: RoomState, now: number, livePeerIds: readonly string[]): RoomState {

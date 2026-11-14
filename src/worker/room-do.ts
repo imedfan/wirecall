@@ -10,7 +10,9 @@ import {
   parseCapacity,
   rebuildLink,
   relaySignal,
+  seenPeer,
   touchPeer,
+  worthSaving,
   type RoomState,
 } from "../shared/room-state";
 import { logEvent } from "./log";
@@ -22,9 +24,6 @@ interface SocketAttachment {
   role: "pending" | "peer";
   peerId?: string;
   at: number;
-  /** Messages in the current window. Two numbers, so the attachment stays small however busy the socket is. */
-  windowStart: number;
-  windowCount: number;
   expiresAt: number;
   roomId: string;
   /** How many people the room holds: two, or a conference. The index decides, not the client. */
@@ -42,9 +41,23 @@ const SPARE_SOCKETS = 2;
 const MESSAGE_WINDOW_MS = 10_000;
 // A Mac with several interfaces plus TURN trickles dozens of candidates per ICE restart, to every peer it is linked with.
 const MESSAGE_LIMIT_PER_LINK = 100;
+// Past the limit a signal is dropped and the call goes on: the client's own watchdogs ask again. Only a socket
+// that sends many times more than any call could is closed.
+const MESSAGE_FLOOD_FACTOR = 10;
+// A socket that has not said hello in this long is not a browser joining a call. It must not hold a place.
+const HELLO_WAIT_MS = 15_000;
 const INDEX_TOUCH_MS = 60 * 60 * 1000;
 
+/** Messages of one socket in the current window. Kept in memory: a room asleep has no flood to count. */
+const messageWindows = new WeakMap<WebSocket, { start: number; count: number }>();
+
 export class RoomDurableObject extends DurableObject<Env> {
+  /** The room as last read or decided. Undefined until the first read after waking up. */
+  private room: RoomState | null | undefined;
+  /** The same room as it stands in storage. */
+  private savedRoom: RoomState | null = null;
+  private indexTouch: number | undefined;
+
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
@@ -62,8 +75,8 @@ export class RoomDurableObject extends DurableObject<Env> {
     if (!Number.isFinite(expiry) || expiry <= Date.now() || !isRoomId(roomId)) {
       return Response.json({ error: "expired" }, { status: 410 });
     }
-    this.ensureSchema();
-    if (this.ctx.getWebSockets().length >= capacity + SPARE_SOCKETS) {
+    closeSilentSockets(this.ctx.getWebSockets(), Date.now());
+    if (this.ctx.getWebSockets().filter((socket) => socket.readyState === WebSocket.OPEN).length >= capacity + SPARE_SOCKETS) {
       return Response.json({ error: "room-full" }, { status: 409 });
     }
     this.rememberRoom(roomId);
@@ -74,8 +87,6 @@ export class RoomDurableObject extends DurableObject<Env> {
     server.serializeAttachment({
       role: "pending",
       at: Date.now(),
-      windowStart: 0,
-      windowCount: 0,
       expiresAt: expiry,
       roomId,
       capacity,
@@ -90,13 +101,14 @@ export class RoomDurableObject extends DurableObject<Env> {
     }
     const attachment = readAttachment(ws);
     const now = Date.now();
-    if (now - attachment.windowStart >= MESSAGE_WINDOW_MS) {
-      attachment.windowStart = now;
-      attachment.windowCount = 0;
+    let window = messageWindows.get(ws);
+    if (!window || now - window.start >= MESSAGE_WINDOW_MS) {
+      window = { start: now, count: 0 };
+      messageWindows.set(ws, window);
     }
-    attachment.windowCount += 1;
-    ws.serializeAttachment(attachment);
-    if (attachment.windowCount > MESSAGE_LIMIT_PER_LINK * (attachment.capacity - 1)) {
+    window.count += 1;
+    const limit = MESSAGE_LIMIT_PER_LINK * (attachment.capacity - 1);
+    if (window.count > limit * MESSAGE_FLOOD_FACTOR) {
       ws.close(1008, "rate");
       return;
     }
@@ -114,6 +126,12 @@ export class RoomDurableObject extends DurableObject<Env> {
       await this.admit(ws, attachment, parsed.message);
       return;
     }
+    const kind = parsed.message.type;
+    if (window.count > limit && (kind === "signal" || kind === "restart" || kind === "rebuild")) {
+      // Ending the call over a burst of ICE candidates would cost more than the burst. Pings and hangup still pass.
+      if (window.count === limit + 1) logEvent("signal-rate-dropped", { limit });
+      return;
+    }
     this.handlePeer(ws, attachment, parsed.message);
   }
 
@@ -125,6 +143,8 @@ export class RoomDurableObject extends DurableObject<Env> {
     if (replacedByNewerSocket(this.ctx.getWebSockets(), attachment.peerId, ws)) return;
     const state = this.readRoom();
     if (!state || !state.peers.some((peer) => peer.peerId === attachment.peerId)) return;
+    // The time the seat went quiet is exact, so the sweep and a newcomer to a full room both count from here.
+    this.writeRoom(seenPeer(state, attachment.peerId, Date.now()));
     // The seat and resume hash stay so the same person can hello again. Hangup and the stale sweep remove it.
     // gone: false tells the other side to keep its media connection: only the signaling socket is away.
     this.sendToPeers({ type: "peer-left", peerId: attachment.peerId, gone: false, peerCount: state.peers.length }, attachment.peerId);
@@ -144,6 +164,8 @@ export class RoomDurableObject extends DurableObject<Env> {
       for (const socket of this.ctx.getWebSockets()) socket.close(4004, "expired");
       this.ctx.storage.sql.exec("DELETE FROM room");
       this.ctx.storage.sql.exec("DELETE FROM turn_cache");
+      this.room = null;
+      this.savedRoom = null;
       await this.ctx.storage.deleteAlarm();
       logEvent("room-expired");
       return;
@@ -177,12 +199,15 @@ export class RoomDurableObject extends DurableObject<Env> {
     });
     if (!admitted.ok) {
       this.writeRoom(admitted.state);
+      this.announceRemoved(admitted.removedPeerIds, admitted.state.peers.length);
       const code = admitted.code === "room-full" ? 4000 : admitted.code === "rate" ? 1008 : 4004;
       ws.close(code, admitted.code);
       logEvent("admit-rejected", { code: admitted.code });
       return;
     }
     this.writeRoom(admitted.state);
+    // Before the welcome: whoever lost a seat to this admission is gone for the others first.
+    this.announceRemoved(admitted.removedPeerIds, admitted.peerCount, admitted.peerId);
     ws.serializeAttachment({ ...attachment, role: "peer", peerId: admitted.peerId });
     if (admitted.resumed) closeOtherSockets(this.ctx.getWebSockets(), admitted.peerId, ws);
     const online = livePeers(this.ctx.getWebSockets(), ws);
@@ -233,11 +258,8 @@ export class RoomDurableObject extends DurableObject<Env> {
     const livePeerIds = livePeers(this.ctx.getWebSockets(), null);
     if (message.type === "ping") {
       const touched = touchPeer(state, peerId, now, ttlMs, livePeerIds);
-      this.writeRoom(touched.state);
-      for (const removed of touched.removedPeerIds) {
-        closePeerSockets(this.ctx.getWebSockets(), removed);
-        this.sendToPeers({ type: "peer-left", peerId: removed, gone: true, peerCount: touched.state.peers.length });
-      }
+      this.keepRoom(touched.state, ttlMs);
+      this.announceRemoved(touched.removedPeerIds, touched.state.peers.length);
       if (!touched.known) {
         ws.close(4004, "expired");
         return;
@@ -280,11 +302,12 @@ export class RoomDurableObject extends DurableObject<Env> {
       ws.close(1008, relayed.code);
       return;
     }
-    this.writeRoom(relayed.state);
+    this.keepRoom(relayed.state, ttlMs);
     if (relayed.deliver) {
       this.sendToPeer(message.to, { type: "signal", from: peerId, kind: message.kind, payload: message.payload, gen: message.gen });
     }
-    logEvent("signal", { kind: message.kind, bytes: message.payload.length, stale: !relayed.deliver });
+    // One line per offer and answer. Candidates come by the dozen and say nothing a line each.
+    if (message.kind !== "ice") logEvent("signal", { kind: message.kind, bytes: message.payload.length, stale: !relayed.deliver });
     this.touchIndex(attachment.roomId, relayed.state.expiresAt, false);
   }
 
@@ -318,8 +341,9 @@ export class RoomDurableObject extends DurableObject<Env> {
   private touchIndex(roomId: string, expiresAt: number, force: boolean): void {
     if (!isRoomId(roomId)) return;
     const now = Date.now();
-    const previous = this.indexTouchedAt();
-    if (!force && now - previous < INDEX_TOUCH_MS) return;
+    this.indexTouch ??= this.indexTouchedAt();
+    if (!force && now - this.indexTouch < INDEX_TOUCH_MS) return;
+    this.indexTouch = now;
     this.ctx.storage.sql.exec(
       "INSERT INTO runtime (id, room_id, index_touch) VALUES (1, ?, ?) ON CONFLICT(id) DO UPDATE SET room_id = excluded.room_id, index_touch = excluded.index_touch",
       roomId,
@@ -371,15 +395,36 @@ export class RoomDurableObject extends DurableObject<Env> {
     `);
   }
 
+  /** Read from storage once after waking up, then kept in memory: a call sets up through dozens of messages. */
   private readRoom(): RoomState | null {
-    this.ensureSchema();
+    if (this.room !== undefined) return this.room;
     const row = this.ctx.storage.sql.exec<{ body: string }>("SELECT body FROM room WHERE id = 1").toArray()[0];
-    if (!row) return null;
-    return JSON.parse(row.body) as RoomState;
+    this.savedRoom = row ? (JSON.parse(row.body) as RoomState) : null;
+    this.room = this.savedRoom;
+    return this.room;
+  }
+
+  /**
+   * For a state where only times moved: it is written when they moved far enough, and otherwise only
+   * remembered. What sleep would lose is a last-seen time at most half a minute old.
+   */
+  private keepRoom(state: RoomState, ttlMs: number): void {
+    this.readRoom();
+    if (worthSaving(this.savedRoom, state, ttlMs)) this.writeRoom(state);
+    else this.room = state;
+  }
+
+  private announceRemoved(peerIds: readonly string[], peerCount: number, exceptPeerId?: string): void {
+    for (const removed of peerIds) {
+      closePeerSockets(this.ctx.getWebSockets(), removed);
+      this.sendToPeers({ type: "peer-left", peerId: removed, gone: true, peerCount }, exceptPeerId);
+    }
   }
 
   /** The whole room is one small row: a handful of seats and the generation of each pair. */
   private writeRoom(state: RoomState): void {
+    this.room = state;
+    this.savedRoom = state;
     this.ctx.storage.sql.exec(
       "INSERT INTO room (id, body) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET body = excluded.body",
       JSON.stringify(state),
@@ -443,14 +488,12 @@ function ttlFromEnv(env: Env): number {
 function readAttachment(ws: WebSocket): SocketAttachment {
   const value = ws.deserializeAttachment() as Partial<SocketAttachment> | null;
   if (!value || (value.role !== "pending" && value.role !== "peer")) {
-    return { role: "pending", at: Date.now(), windowStart: 0, windowCount: 0, expiresAt: 0, roomId: "", capacity: parseCapacity(undefined) };
+    return { role: "pending", at: Date.now(), expiresAt: 0, roomId: "", capacity: parseCapacity(undefined) };
   }
   return {
     role: value.role,
     peerId: value.peerId,
     at: value.at ?? Date.now(),
-    windowStart: value.windowStart ?? 0,
-    windowCount: value.windowCount ?? 0,
     expiresAt: value.expiresAt ?? 0,
     roomId: value.roomId ?? "",
     capacity: parseCapacity(value.capacity),
@@ -471,6 +514,14 @@ function closeOtherSockets(sockets: readonly WebSocket[], peerId: string, keep: 
   for (const socket of sockets) {
     if (socket === keep) continue;
     if (readAttachment(socket).peerId === peerId) socket.close(4002, "replaced");
+  }
+}
+
+function closeSilentSockets(sockets: readonly WebSocket[], now: number): void {
+  for (const socket of sockets) {
+    if (socket.readyState !== WebSocket.OPEN) continue;
+    const attachment = readAttachment(socket);
+    if (attachment.role === "pending" && now - attachment.at > HELLO_WAIT_MS) socket.close(1008, "hello-first");
   }
 }
 

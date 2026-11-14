@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { createIndexedRoom, emptyIndex, lookupRoom } from "../../src/shared/room-index-state";
-import { admitPeer, capacityOf, GROUP_CAPACITY, leavePeer, linkGen, newRoom, parseCapacity, rebuildLink, relaySignal, touchPeer, type RoomState } from "../../src/shared/room-state";
+import { createIndexedRoom, emptyIndex, legacyRooms } from "../../src/shared/room-index-state";
+import { admitPeer, capacityOf, EVICT_AWAY_MS, GROUP_CAPACITY, leavePeer, linkGen, newRoom, parseCapacity, rebuildLink, relaySignal, seenPeer, touchPeer, worthSaving, type RoomState } from "../../src/shared/room-state";
 import { createRoomId } from "../../src/shared/ids";
 
 const ttl = 60_000;
@@ -126,13 +126,70 @@ describe("room for two", () => {
     expect(left.peerCount).toBe(0);
   });
 
-  it("does not let one address create rooms without bound and hides unknown rooms", () => {
+  it("gives a seat whose socket has been gone a while to a newcomer when the room is full", () => {
+    const state = roomOf(["a", "b"]);
+    // a's socket closed at 10 s. Its seat and its resume token stay.
+    const away = seenPeer(state, "a", 10_000);
+    const soon = admit(away, "c", "hash-c", 10_000 + EVICT_AWAY_MS - 1, ["b"]);
+    expect(soon.ok).toBe(false);
+    if (!soon.ok) expect(soon.code).toBe("room-full");
+    const later = admit(away, "c", "hash-c", 10_000 + EVICT_AWAY_MS, ["b"]);
+    if (!later.ok) throw new Error("admit");
+    expect(later.removedPeerIds).toEqual(["a"]);
+    expect(later.state.peers.map((peer) => peer.peerId)).toEqual(["b", "c"]);
+    // The link to the one who left is gone with them, and the newcomer answers on the new one.
+    expect(Object.keys(later.state.links)).toHaveLength(1);
+    expect(later.links).toEqual([{ peerId: "b", gen: later.state.gen, polite: true, kept: false }]);
+    // Someone whose socket is open is never moved, however long ago they were last heard.
+    const both = admit(state, "c", "hash-c", 80_000, ["a", "b"]);
+    expect(both.ok).toBe(false);
+    // The old token of the seat that was given away opens nothing.
+    const stale = admitPeer(later.state, { now: 40_000, ttlMs: ttl, resumeHash: "hash-a", newPeerId: "d", newResumeHash: "hash-d", livePeerIds: ["b", "c"] });
+    expect(stale.ok).toBe(false);
+  });
+
+  it("names the seats an admission emptied so the others can be told", () => {
+    const state = { ...roomOf(["a", "b"]), expiresAt: 10_000_000 };
+    // a was last heard long ago and has no socket: the sweep removes it before the newcomer sits down.
+    const joined = admit(state, "c", "hash-c", 200_000, ["b"]);
+    if (!joined.ok) throw new Error("admit");
+    expect(joined.removedPeerIds).toEqual(["a"]);
+    expect(admit(state, "c", "hash-c", 2_000, ["a", "b"]).removedPeerIds).toEqual([]);
+  });
+
+  it("writes the room when seats or links change and not when only the clock moved", () => {
+    const state = roomOf(["a", "b"]);
+    const longTtl = 14 * 24 * 3_600_000;
+    const relayed = relaySignal(state, { now: 5_000, ttlMs: longTtl, fromPeerId: "a", toPeerId: "b", gen: linkGen(state, "a", "b")!, livePeerIds: ["a", "b"] });
+    if (!relayed.ok) throw new Error("relay");
+    const saved = relayed.state;
+    expect(worthSaving(null, saved, longTtl)).toBe(true);
+    // A burst of candidates a moment later: the same seats, times a second older.
+    const next = relaySignal(saved, { now: 6_000, ttlMs: longTtl, fromPeerId: "a", toPeerId: "b", gen: linkGen(saved, "a", "b")!, livePeerIds: ["a", "b"] });
+    if (!next.ok) throw new Error("relay");
+    expect(worthSaving(saved, next.state, longTtl)).toBe(false);
+    // Half a minute on, the last-seen time is worth keeping.
+    const pinged = touchPeer(saved, "a", 40_000, longTtl, ["a", "b"]);
+    expect(worthSaving(saved, pinged.state, longTtl)).toBe(true);
+    // An hour on, so is the expiry.
+    expect(worthSaving(saved, { ...saved, expiresAt: saved.expiresAt + 3_600_000 }, longTtl)).toBe(true);
+    expect(worthSaving(saved, rebuildLink(saved, "a", "b", linkGen(saved, "a", "b")!).state, longTtl)).toBe(true);
+    expect(worthSaving(saved, leavePeer(saved, "b").state, longTtl)).toBe(true);
+    const resumed = admitPeer(saved, { now: 6_000, ttlMs: longTtl, resumeHash: "hash-a", newPeerId: "x", newResumeHash: "hash-a2", livePeerIds: ["b"], keep: [{ peerId: "b", gen: linkGen(saved, "a", "b")! }] });
+    if (!resumed.ok) throw new Error("resume");
+    expect(worthSaving(saved, resumed.state, longTtl)).toBe(true);
+  });
+
+  it("does not let one address create rooms without bound", () => {
     let state = emptyIndex();
     const ip = "hashed-ip";
     for (let index = 0; index < 2; index += 1) {
       const created = createIndexedRoom(state, { roomId: createRoomId(), ipHash: ip, now: 1_000, ...limits });
       expect(created.ok).toBe(true);
-      if (created.ok) state = created.state;
+      if (created.ok) {
+        state = created.state;
+        expect(created.room.expiresAt).toBe(1_000 + ttl);
+      }
     }
     const blocked = createIndexedRoom(state, { roomId: createRoomId(), ipHash: ip, now: 1_500, ...limits });
     expect(blocked.ok).toBe(false);
@@ -140,14 +197,28 @@ describe("room for two", () => {
     const other = createIndexedRoom(blocked.state, { roomId: createRoomId(), ipHash: "other", now: 1_500, ...limits });
     expect(other.ok).toBe(true);
     if (!other.ok) return;
-    const known = other.state.rooms[0]?.roomId ?? "";
-    const found = lookupRoom(other.state, known, 1_000);
-    expect(found.room?.roomId).toBe(known);
-    const missing = lookupRoom(other.state, createRoomId(), 1_000);
-    expect(missing.room).toBeNull();
-    const expired = lookupRoom(other.state, known, 1_000 + ttl + 1);
-    expect(expired.room).toBeNull();
-    expect(expired.state.rooms.some((room) => room.roomId === known)).toBe(false);
+    // The day's allowance is spent whoever asks.
+    const daily = createIndexedRoom(other.state, { roomId: createRoomId(), ipHash: "third", now: 1_600, ...limits });
+    expect(daily.ok).toBe(false);
+    if (!daily.ok) expect(daily.code).toBe("daily");
+    expect(createIndexedRoom(emptyIndex(), { roomId: "nope", ipHash: ip, now: 1_000, ...limits }).ok).toBe(false);
+  });
+
+  it("carries the rooms of an index saved as one value over to rows and skips what is not a room", () => {
+    const id = createRoomId();
+    const group = createRoomId();
+    const saved = {
+      rooms: [{ roomId: id, createdAt: 5, expiresAt: 9_000 }, { roomId: group, createdAt: 6, expiresAt: 9_500, kind: "group" }, { roomId: "short", expiresAt: 1 }, { roomId: createRoomId() }, null],
+      creates: [],
+      dayStamp: "",
+      dayCount: 0,
+    };
+    expect(legacyRooms(saved)).toEqual([
+      { roomId: id, createdAt: 5, expiresAt: 9_000 },
+      { roomId: group, createdAt: 6, expiresAt: 9_500, kind: "group" },
+    ]);
+    expect(legacyRooms(emptyIndex())).toEqual([]);
+    expect(legacyRooms(null)).toEqual([]);
   });
 
   it("refuses admission and signaling once the room TTL has passed", () => {
@@ -259,7 +330,7 @@ describe("conference room", () => {
     if (!pair.ok) throw new Error("create");
     const group = createIndexedRoom(pair.state, { roomId: createRoomId(), ipHash: "ip", now: 1_000, kind: "group", ...limits });
     if (!group.ok) throw new Error("create");
-    expect(lookupRoom(group.state, pair.roomId, 1_000).room?.kind).toBeUndefined();
-    expect(lookupRoom(group.state, group.roomId, 1_000).room?.kind).toBe("group");
+    expect(pair.room.kind).toBeUndefined();
+    expect(group.room.kind).toBe("group");
   });
 });
