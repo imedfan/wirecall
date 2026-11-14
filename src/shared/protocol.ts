@@ -1,7 +1,10 @@
 import { isResumeToken } from "./ids";
 
-// Version 2 adds the connection generation. A page from before it cannot mix its signals into a newer call.
-export const PROTOCOL_VERSION = 2;
+// Version 3 addresses every signal to one peer and gives each pair of peers its own connection generation,
+// so a room can hold more than two. A page from before it cannot mix its signals into a newer call.
+export const PROTOCOL_VERSION = 3;
+/** A hello may name this many connections it still holds. More than any room can have. */
+export const MAX_KEPT_LINKS = 16;
 export const MAX_GENERATION = 1_000_000_000;
 export const MAX_CLIENT_MESSAGE_CHARS = 40_000;
 export const MAX_SDP_CHARS = 32_000;
@@ -15,11 +18,17 @@ export interface IcePayload {
   sdpMLineIndex: number | null;
 }
 
+/** A connection the client still holds: the peer on the other end and the generation it was built for. */
+export interface KeptLink {
+  peerId: string;
+  gen: number;
+}
+
 export type ClientMessage =
-  | { type: "hello"; protocol: number; resume?: string; gen?: number }
-  | { type: "signal"; kind: SignalKind; payload: string; gen: number }
-  | { type: "restart"; gen: number; ack: boolean }
-  | { type: "rebuild"; gen: number }
+  | { type: "hello"; protocol: number; resume?: string; keep?: KeptLink[] }
+  | { type: "signal"; to: string; kind: SignalKind; payload: string; gen: number }
+  | { type: "restart"; to: string; gen: number; ack: boolean }
+  | { type: "rebuild"; to: string; gen: number }
   | { type: "hangup" }
   | { type: "ping" };
 
@@ -42,9 +51,10 @@ export function parseClientMessage(raw: string): { ok: true; message: ClientMess
       if (typeof record.resume !== "string" || !isResumeToken(record.resume)) return { ok: false, code: "bad-message" };
       message.resume = record.resume;
     }
-    if (record.gen !== undefined) {
-      if (!isGeneration(record.gen)) return { ok: false, code: "bad-message" };
-      message.gen = record.gen;
+    if (record.keep !== undefined) {
+      const keep = parseKeptLinks(record.keep);
+      if (!keep) return { ok: false, code: "bad-message" };
+      message.keep = keep;
     }
     return { ok: true, message };
   }
@@ -56,18 +66,37 @@ export function parseClientMessage(raw: string): { ok: true; message: ClientMess
     }
     if (typeof record.payload !== "string") return { ok: false, code: "bad-message" };
     if (!validSignalPayload(record.kind, record.payload)) return { ok: false, code: "bad-message" };
-    if (!isGeneration(record.gen)) return { ok: false, code: "bad-message" };
-    return { ok: true, message: { type: "signal", kind: record.kind, payload: record.payload, gen: record.gen } };
+    if (!isGeneration(record.gen) || !isPeerId(record.to)) return { ok: false, code: "bad-message" };
+    return { ok: true, message: { type: "signal", to: record.to, kind: record.kind, payload: record.payload, gen: record.gen } };
   }
   if (record.type === "restart") {
-    if (!isGeneration(record.gen) || typeof record.ack !== "boolean") return { ok: false, code: "bad-message" };
-    return { ok: true, message: { type: "restart", gen: record.gen, ack: record.ack } };
+    if (!isGeneration(record.gen) || !isPeerId(record.to) || typeof record.ack !== "boolean") return { ok: false, code: "bad-message" };
+    return { ok: true, message: { type: "restart", to: record.to, gen: record.gen, ack: record.ack } };
   }
   if (record.type === "rebuild") {
-    if (!isGeneration(record.gen)) return { ok: false, code: "bad-message" };
-    return { ok: true, message: { type: "rebuild", gen: record.gen } };
+    if (!isGeneration(record.gen) || !isPeerId(record.to)) return { ok: false, code: "bad-message" };
+    return { ok: true, message: { type: "rebuild", to: record.to, gen: record.gen } };
   }
   return { ok: false, code: "bad-message" };
+}
+
+const PEER_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
+
+/** Peer ids are the UUIDs the room hands out. Anything else is not an address. */
+export function isPeerId(value: unknown): value is string {
+  return typeof value === "string" && PEER_ID_RE.test(value);
+}
+
+function parseKeptLinks(value: unknown): KeptLink[] | null {
+  if (!Array.isArray(value) || value.length > MAX_KEPT_LINKS) return null;
+  const links: KeptLink[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object") return null;
+    const { peerId, gen } = item as Record<string, unknown>;
+    if (!isPeerId(peerId) || !isGeneration(gen)) return null;
+    links.push({ peerId, gen });
+  }
+  return links;
 }
 
 export function isGeneration(value: unknown): value is number {

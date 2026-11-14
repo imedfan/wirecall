@@ -146,6 +146,23 @@ describe("quality ladder", () => {
     expect(controller.current()).toBe("good");
   });
 
+  it("climbs back after a real drop although the estimate cannot run far ahead of what is sent", () => {
+    const controller = new AdaptiveController();
+    // The link collapses and the estimate with it.
+    feed(controller, { lossRatio: 0.2, rttMs: 600, availableOutgoingBitrate: 150_000 }, 40, 0);
+    expect(controller.current()).toBe("very-weak");
+    // The link is fine again. A browser lets the estimate grow to about one and a half times what the
+    // capped encoder sends, never to the next tier's bitrate with a margin on top.
+    let at = 200_000;
+    const seen: QualityTier[] = [];
+    for (let index = 0; index < 80; index += 1) {
+      const sent = TIER_PROFILES[controller.current()].maxBitrate;
+      seen.push(controller.observe({ atMs: at, lossRatio: 0.001, rttMs: 40, availableOutgoingBitrate: sent * 1.5 }).tier);
+      at += 2_000;
+    }
+    expect(seen.filter((tier, index) => tier !== seen[index - 1])).toEqual(["very-weak", "weak", "ok", "good"]);
+  });
+
   it("steps down when the bitrate estimate cannot carry the current tier", () => {
     const controller = new AdaptiveController();
     const tiers = feed(controller, { lossRatio: 0, rttMs: 40, availableOutgoingBitrate: 600_000 }, 6, 0);

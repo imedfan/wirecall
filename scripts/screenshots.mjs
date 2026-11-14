@@ -19,7 +19,7 @@ const denied = await chromium.launch({ args: ["--deny-permission-prompts"] });
 
 async function createRoom(page) {
   await page.goto(`${base}/`);
-  await page.getByRole("button", { name: "Создать ссылку" }).click();
+  await page.getByRole("button", { name: "Создать ссылку", exact: true }).click();
   return page.getByRole("link", { name: "Открыть звонок" }).getAttribute("href");
 }
 

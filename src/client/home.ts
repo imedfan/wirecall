@@ -1,4 +1,5 @@
 import { expiryLabel, shortLink } from "../shared/link-label";
+import { GROUP_CAPACITY } from "../shared/room-state";
 import { aurora, button, canShare, el, flashLabel, linkButton, mark, shareLink, sheet } from "./ui";
 
 export interface Health {
@@ -20,12 +21,14 @@ export async function loadHealth(): Promise<Health> {
 interface CreatedRoom {
   path: string;
   expiresAt: number;
+  kind?: "pair" | "group";
+  capacity?: number;
 }
 
 export async function renderHome(root: HTMLElement): Promise<void> {
   const page = el("main", "home");
   const hero = el("div", "hero");
-  hero.append(el("h1", "", "Звонок для двоих"), el("p", "lede", "Личная ссылка. Без записи разговора."));
+  hero.append(el("h1", "", "Звонок по ссылке"), el("p", "lede", `Для двоих или для компании до ${GROUP_CAPACITY} человек. Без записи разговора.`));
 
   const action = el("div", "action");
   const gate = el("input", "field");
@@ -36,11 +39,14 @@ export async function renderHome(root: HTMLElement): Promise<void> {
   gate.hidden = true;
   const create = button("Создать ссылку", "primary", "video");
   create.classList.add("btn-hero");
+  // The second, quieter button: the same thing for more than two people.
+  const createGroup = button("Создать ссылку для конференции", "glass", "group");
+  createGroup.classList.add("btn-group");
   const problem = el("p", "problem");
   problem.setAttribute("role", "status");
   problem.setAttribute("aria-live", "polite");
   const result = el("div", "result");
-  action.append(gate, create, problem, result);
+  action.append(gate, create, createGroup, problem, result);
 
   const about = aboutSheet();
   const more = button("Подробнее", "quiet");
@@ -51,13 +57,15 @@ export async function renderHome(root: HTMLElement): Promise<void> {
   root.replaceChildren(page);
 
   let gated = false;
-  create.addEventListener("click", async () => {
+  const make = async (group: boolean): Promise<void> => {
     create.disabled = true;
+    createGroup.disabled = true;
     problem.textContent = "";
     const headers = new Headers();
     if (gated) headers.set("x-wirecall-gate", gate.value);
-    const response = await fetch("/api/rooms", { method: "POST", headers }).catch(() => null);
+    const response = await fetch(group ? "/api/rooms?kind=group" : "/api/rooms", { method: "POST", headers }).catch(() => null);
     create.disabled = false;
+    createGroup.disabled = false;
     if (!response) {
       problem.textContent = "Нет связи. Проверьте интернет";
       return;
@@ -72,12 +80,15 @@ export async function renderHome(root: HTMLElement): Promise<void> {
       return;
     }
     const room = await response.json() as CreatedRoom;
-    // The link is ready: the card takes the place of the big button, so the screen keeps one main action.
+    // The link is ready: the card takes the place of the buttons, so the screen keeps one main action.
     gate.hidden = true;
     create.hidden = true;
+    createGroup.hidden = true;
     result.replaceChildren(linkCard(room));
     result.querySelector<HTMLElement>("a")?.focus();
-  });
+  };
+  create.addEventListener("click", () => void make(false));
+  createGroup.addEventListener("click", () => void make(true));
 
   const health = await loadHealth();
   gated = health.createGate;
@@ -86,13 +97,15 @@ export async function renderHome(root: HTMLElement): Promise<void> {
 
 function linkCard(room: CreatedRoom): HTMLElement {
   const url = new URL(room.path, location.origin).toString();
+  const group = room.kind === "group";
   const card = el("section", "link-card glass");
-  card.setAttribute("aria-label", "Ссылка на звонок");
+  card.setAttribute("aria-label", group ? "Ссылка на конференцию" : "Ссылка на звонок");
   const short = el("p", "link-short", shortLink(url));
   // The whole address is only in the attribute and behind the buttons, never printed large.
   short.title = url;
-  const until = el("p", "note", expiryLabel(room.expiresAt, Date.now()));
-  const open = linkButton("Открыть звонок", room.path);
+  const term = expiryLabel(room.expiresAt, Date.now());
+  const until = el("p", "note", group ? `До ${room.capacity ?? GROUP_CAPACITY} человек · ${term}` : term);
+  const open = linkButton(group ? "Открыть конференцию" : "Открыть звонок", room.path);
   open.classList.add("open-call");
   const send = button(canShare() ? "Отправить ссылку" : "Скопировать", "glass", canShare() ? "share" : undefined);
   send.addEventListener("click", () => void shareLink(url, flashLabel(send)));
@@ -105,8 +118,9 @@ function aboutSheet(): HTMLDialogElement {
   const { dialog, body } = sheet("Как это работает");
   const list = el("ul", "about");
   for (const line of [
-    "Звонок идёт напрямую между двумя устройствами.",
+    "Звонок идёт напрямую между устройствами участников.",
     "Сервер только знакомит их. Разговор он не видит и не записывает.",
+    `В конференции до ${GROUP_CAPACITY} человек: каждое устройство соединяется с каждым, и больше оно не потянет.`,
     "В закрытой сети, например рабочей, звонок может не собраться. Попробуйте другую сеть.",
     "Не сворачивайте браузер во время звонка: в фоне картинка и звук останавливаются.",
     "На iPhone: «Поделиться» → «На экран „Домой“», и сайт откроется одним касанием.",

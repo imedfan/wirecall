@@ -1,13 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { createRoomId } from "../shared/ids";
-import {
-  createIndexedRoom,
-  emptyIndex,
-  lookupRoom,
-  nextIndexAlarm,
-  touchRoom,
-  type IndexState,
-} from "../shared/room-index-state";
+import { createIndexedRoom, emptyIndex, legacyRooms, type IndexState } from "../shared/room-index-state";
+import type { RoomKind } from "../shared/room-state";
 
 const PER_IP_LIMIT = 30;
 const PER_IP_WINDOW_MS = 60 * 60 * 1000;
@@ -21,46 +15,46 @@ export class RoomIndexDurableObject extends DurableObject<Env> {
     });
   }
 
-  async createRoom(ipHash: string, now: number, ttlMs: number): Promise<{ ok: true; roomId: string; expiresAt: number } | { ok: false; code: string }> {
-    let created: { ok: true; roomId: string; expiresAt: number } | { ok: false; code: string } | null = null;
-    for (let attempt = 0; attempt < 3 && !created; attempt += 1) {
-      const current = this.read();
-      const result = createIndexedRoom(current, {
-        roomId: createRoomId(),
-        ipHash,
-        now,
-        ttlMs,
-        perIpLimit: PER_IP_LIMIT,
-        perIpWindowMs: PER_IP_WINDOW_MS,
-        dailyLimit: DAILY_LIMIT,
-      });
-      if (!result.ok) return { ok: false, code: result.code };
-      this.write(result.state);
-      created = { ok: true, roomId: result.roomId, expiresAt: result.expiresAt };
-    }
-    await this.schedule(created ? this.read() : emptyIndex());
-    if (!created) return { ok: false, code: "rate" };
-    return created;
+  async createRoom(ipHash: string, now: number, ttlMs: number, kind: RoomKind = "pair"): Promise<{ ok: true; roomId: string; expiresAt: number } | { ok: false; code: string }> {
+    const result = createIndexedRoom(this.readLimits(), {
+      roomId: createRoomId(),
+      ipHash,
+      now,
+      ttlMs,
+      kind,
+      perIpLimit: PER_IP_LIMIT,
+      perIpWindowMs: PER_IP_WINDOW_MS,
+      dailyLimit: DAILY_LIMIT,
+    });
+    this.writeLimits(result.state);
+    if (!result.ok) return { ok: false, code: result.code };
+    const room = result.room;
+    this.ctx.storage.sql.exec(
+      "INSERT OR REPLACE INTO rooms (room_id, created_at, expires_at, kind) VALUES (?, ?, ?, ?)",
+      room.roomId,
+      room.createdAt,
+      room.expiresAt,
+      room.kind ?? "pair",
+    );
+    await this.schedule(false);
+    return { ok: true, roomId: room.roomId, expiresAt: room.expiresAt };
   }
 
-  async lookup(roomId: string, now: number): Promise<{ expiresAt: number } | null> {
-    const result = lookupRoom(this.read(), roomId, now);
-    this.write(result.state);
-    await this.schedule(result.state);
-    return result.room ? { expiresAt: result.room.expiresAt } : null;
+  /** One row read and nothing written: every join and every reconnect of every call comes through here. */
+  async lookup(roomId: string, now: number): Promise<{ expiresAt: number; kind: RoomKind } | null> {
+    const row = this.ctx.storage.sql
+      .exec<{ expires_at: number; kind: string }>("SELECT expires_at, kind FROM rooms WHERE room_id = ? AND expires_at > ?", roomId, now)
+      .toArray()[0];
+    return row ? { expiresAt: row.expires_at, kind: row.kind === "group" ? "group" : "pair" } : null;
   }
 
   async touch(roomId: string, expiresAt: number, now: number): Promise<void> {
-    const next = touchRoom(this.read(), roomId, expiresAt, now);
-    this.write(next);
-    await this.schedule(next);
+    this.ctx.storage.sql.exec("UPDATE rooms SET expires_at = MAX(expires_at, ?) WHERE room_id = ? AND expires_at > ?", expiresAt, roomId, now);
   }
 
   async alarm(): Promise<void> {
-    const now = Date.now();
-    const result = lookupRoom(this.read(), "", now);
-    this.write(result.state);
-    await this.schedule(result.state);
+    this.ctx.storage.sql.exec("DELETE FROM rooms WHERE expires_at <= ?", Date.now());
+    await this.schedule(true);
   }
 
   private ensureSchema(): void {
@@ -68,12 +62,47 @@ export class RoomIndexDurableObject extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS index_state (
         id INTEGER PRIMARY KEY CHECK (id = 1),
         body TEXT NOT NULL
-      )
+      );
+      CREATE TABLE IF NOT EXISTS rooms (
+        room_id TEXT PRIMARY KEY,
+        created_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        kind TEXT NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS rooms_expiry ON rooms (expires_at);
     `);
+    this.moveLegacyRooms();
   }
 
-  private read(): IndexState {
-    this.ensureSchema();
+  /** The index used to be one JSON value with every room in it. Its rooms become rows, once. */
+  private moveLegacyRooms(): void {
+    const row = this.ctx.storage.sql.exec<{ body: string }>("SELECT body FROM index_state WHERE id = 1").toArray()[0];
+    if (!row) return;
+    let saved: unknown;
+    try {
+      saved = JSON.parse(row.body);
+    } catch {
+      return;
+    }
+    if (!saved || typeof saved !== "object" || !("rooms" in saved)) return;
+    for (const room of legacyRooms(saved)) {
+      this.ctx.storage.sql.exec(
+        "INSERT OR IGNORE INTO rooms (room_id, created_at, expires_at, kind) VALUES (?, ?, ?, ?)",
+        room.roomId,
+        room.createdAt,
+        room.expiresAt,
+        room.kind ?? "pair",
+      );
+    }
+    const limits = saved as Partial<IndexState>;
+    this.writeLimits({
+      creates: Array.isArray(limits.creates) ? limits.creates : [],
+      dayStamp: typeof limits.dayStamp === "string" ? limits.dayStamp : "",
+      dayCount: typeof limits.dayCount === "number" ? limits.dayCount : 0,
+    });
+  }
+
+  private readLimits(): IndexState {
     const row = this.ctx.storage.sql
       .exec<{ body: string }>("SELECT body FROM index_state WHERE id = 1")
       .toArray()[0];
@@ -81,19 +110,21 @@ export class RoomIndexDurableObject extends DurableObject<Env> {
     return JSON.parse(row.body) as IndexState;
   }
 
-  private write(state: IndexState): void {
+  private writeLimits(state: IndexState): void {
     this.ctx.storage.sql.exec(
       "INSERT INTO index_state (id, body) VALUES (1, ?) ON CONFLICT(id) DO UPDATE SET body = excluded.body",
       JSON.stringify(state),
     );
   }
 
-  private async schedule(state: IndexState): Promise<void> {
-    const when = nextIndexAlarm(state);
-    if (when === null) {
-      await this.ctx.storage.deleteAlarm();
-      return;
-    }
-    await this.ctx.storage.setAlarm(when);
+  /**
+   * The alarm only clears expired rows, so it need not be exact. A room that was touched since simply
+   * outlives one firing. An alarm that is already set is left alone unless it has just fired.
+   */
+  private async schedule(fired: boolean): Promise<void> {
+    if (!fired && (await this.ctx.storage.getAlarm()) !== null) return;
+    const row = this.ctx.storage.sql.exec<{ soonest: number | null }>("SELECT MIN(expires_at) AS soonest FROM rooms").toArray()[0];
+    if (row?.soonest === null || row?.soonest === undefined) return;
+    await this.ctx.storage.setAlarm(row.soonest);
   }
 }

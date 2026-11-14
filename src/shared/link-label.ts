@@ -5,8 +5,8 @@
 export function shortLink(url: string): string {
   try {
     const parsed = new URL(url);
-    const id = parsed.pathname.split("/")[2] ?? "";
-    return `${parsed.host}/r/${id.slice(0, 4)}…`;
+    const [, kind = "r", id = ""] = parsed.pathname.split("/");
+    return `${parsed.host}/${kind}/${id.slice(0, 4)}…`;
   } catch {
     return "…";
   }

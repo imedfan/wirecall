@@ -1,4 +1,4 @@
-import { scaleForHeight, TIER_PROFILES, type QualityTier } from "../shared/adaptive";
+import { scaleToHeight, TIER_PROFILES, type QualityTier, type TierProfile } from "../shared/adaptive";
 
 export interface MediaIntent {
   micEnabled: boolean;
@@ -81,10 +81,14 @@ const nativeSizes = new WeakMap<object, { width?: number; height?: number }>();
  * A call that does not throw is not proof the browser obeyed. The diagnostics sheet shows the frame rate
  * and size the encoder really produces, from getStats, and that is where each device has to be checked.
  */
-export async function applyVideoTier(sender: VideoSenderControl, tier: QualityTier, intent: MediaIntent): Promise<VideoTierResult> {
+export async function applyVideoTier(
+  sender: VideoSenderControl,
+  tier: QualityTier,
+  intent: MediaIntent,
+  profile: TierProfile = TIER_PROFILES[tier],
+): Promise<VideoTierResult> {
   const track = sender.track;
   if (track) applyMediaIntent(track, intent);
-  const profile = TIER_PROFILES[tier];
   const settings = track?.getSettings() ?? {};
   if (track && !nativeSizes.has(track) && settings.width && settings.height) {
     nativeSizes.set(track, { width: settings.width, height: settings.height });
@@ -98,7 +102,7 @@ export async function applyVideoTier(sender: VideoSenderControl, tier: QualityTi
       active: true,
       maxBitrate: profile.maxBitrate,
       maxFramerate: profile.maxFramerate,
-      scaleResolutionDownBy: scaleForHeight(shortSide, tier),
+      scaleResolutionDownBy: scaleToHeight(shortSide, profile.targetHeight),
     };
     try {
       // Asks the encoder to give up frames before sharpness when the link gets tight.

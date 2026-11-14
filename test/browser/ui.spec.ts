@@ -15,7 +15,7 @@ async function launch(): Promise<Browser> {
 
 async function createRoom(page: Page): Promise<string> {
   await page.goto("/");
-  await page.getByRole("button", { name: "Создать ссылку" }).click();
+  await page.getByRole("button", { name: "Создать ссылку", exact: true }).click();
   const path = await page.getByRole("link", { name: "Открыть звонок" }).getAttribute("href");
   expect(path).toMatch(/^\/r\//u);
   return path!;

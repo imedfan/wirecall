@@ -41,6 +41,8 @@ export interface StatSummary {
   bitrate?: number;
   availableOutgoingBitrate?: number;
   encoderLimit?: EncoderLimitReason;
+  /** The video codec really in use for sending, as the browser names it: H264, VP8. */
+  codec?: string;
   /** Share of incoming frames dropped before display over the last interval. */
   framesDroppedRatio?: number;
   /** Share of incoming audio the browser had to invent to cover a gap. */
@@ -106,6 +108,7 @@ export function summarizeStats(reports: readonly StatReport[], previous: StatCou
     bitrate,
     availableOutgoingBitrate: readStatNumber(pair?.availableOutgoingBitrate),
     encoderLimit: encoderLimit(outbound?.qualityLimitationReason),
+    codec: codecName(reports, outbound?.codecId),
     framesDroppedRatio: decoded !== undefined && dropped !== undefined && decoded + dropped > 0 ? dropped / (decoded + dropped) : undefined,
     concealmentRatio: concealed !== undefined && samples !== undefined && samples > 0 ? Math.min(1, concealed / samples) : undefined,
     counters,
@@ -115,6 +118,13 @@ export function summarizeStats(reports: readonly StatReport[], previous: StatCou
 function mediaKind(report: StatReport): unknown {
   // Older Safari names the field mediaType.
   return report.kind ?? report.mediaType;
+}
+
+function codecName(reports: readonly StatReport[], codecId: unknown): string | undefined {
+  if (typeof codecId !== "string") return undefined;
+  const mime = reports.find((report) => report.type === "codec" && report.id === codecId)?.mimeType;
+  if (typeof mime !== "string" || !/^video\/[A-Za-z0-9.-]{1,16}$/u.test(mime)) return undefined;
+  return mime.slice("video/".length);
 }
 
 function encoderLimit(value: unknown): EncoderLimitReason | undefined {

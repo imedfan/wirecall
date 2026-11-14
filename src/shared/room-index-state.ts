@@ -1,9 +1,12 @@
 import { isRoomId } from "./ids";
+import type { RoomKind } from "./room-state";
 
 export interface IndexRoom {
   roomId: string;
   createdAt: number;
   expiresAt: number;
+  /** Absent on rooms made before conferences existed: those are for two. */
+  kind?: RoomKind;
 }
 
 export interface IndexCreateBucket {
@@ -12,21 +15,22 @@ export interface IndexCreateBucket {
   count: number;
 }
 
+/** What limits the creation of rooms. The rooms themselves are rows of their own, one per room. */
 export interface IndexState {
-  rooms: IndexRoom[];
   creates: IndexCreateBucket[];
   dayStamp: string;
   dayCount: number;
 }
 
 export type CreateRoomResult =
-  | { ok: true; state: IndexState; roomId: string; expiresAt: number }
+  | { ok: true; state: IndexState; room: IndexRoom }
   | { ok: false; state: IndexState; code: "bad-room" | "rate" | "daily" };
 
 export function emptyIndex(): IndexState {
-  return { rooms: [], creates: [], dayStamp: "", dayCount: 0 };
+  return { creates: [], dayStamp: "", dayCount: 0 };
 }
 
+/** Counts one more room against the address and the day, and describes the room to store if both allow it. */
 export function createIndexedRoom(
   state: IndexState,
   input: {
@@ -34,62 +38,47 @@ export function createIndexedRoom(
     ipHash: string;
     now: number;
     ttlMs: number;
+    kind?: RoomKind;
     perIpLimit: number;
     perIpWindowMs: number;
     dailyLimit: number;
   },
 ): CreateRoomResult {
-  const purged = purgeExpired(state, input.now);
-  if (!isRoomId(input.roomId)) return { ok: false, state: purged, code: "bad-room" };
+  const limits: IndexState = { creates: state.creates, dayStamp: state.dayStamp, dayCount: state.dayCount };
+  if (!isRoomId(input.roomId)) return { ok: false, state: limits, code: "bad-room" };
   const dayStamp = utcDay(input.now);
-  const dayCount = purged.dayStamp === dayStamp ? purged.dayCount : 0;
+  const dayCount = limits.dayStamp === dayStamp ? limits.dayCount : 0;
   if (dayCount >= input.dailyLimit) {
-    return { ok: false, state: { ...purged, dayStamp, dayCount }, code: "daily" };
+    return { ok: false, state: { ...limits, dayStamp, dayCount }, code: "daily" };
   }
-  const creates = purged.creates
+  const creates = limits.creates
     .filter((bucket) => input.now - bucket.windowStart < input.perIpWindowMs)
     .map((bucket) => ({ ...bucket }));
   const bucket = creates.find((entry) => entry.ipHash === input.ipHash);
   if (bucket && bucket.count >= input.perIpLimit) {
-    return { ok: false, state: { ...purged, creates, dayStamp, dayCount }, code: "rate" };
+    return { ok: false, state: { creates, dayStamp, dayCount }, code: "rate" };
   }
   if (bucket) bucket.count += 1;
   else creates.push({ ipHash: input.ipHash, windowStart: input.now, count: 1 });
-  const expiresAt = input.now + input.ttlMs;
-  const rooms = purged.rooms.filter((room) => room.roomId !== input.roomId);
-  rooms.push({ roomId: input.roomId, createdAt: input.now, expiresAt });
-  return {
-    ok: true,
-    roomId: input.roomId,
-    expiresAt,
-    state: { rooms, creates, dayStamp, dayCount: dayCount + 1 },
-  };
+  const room: IndexRoom = { roomId: input.roomId, createdAt: input.now, expiresAt: input.now + input.ttlMs };
+  if (input.kind === "group") room.kind = "group";
+  return { ok: true, room, state: { creates, dayStamp, dayCount: dayCount + 1 } };
 }
 
-export function lookupRoom(state: IndexState, roomId: string, now: number): { state: IndexState; room: IndexRoom | null } {
-  const purged = purgeExpired(state, now);
-  const room = purged.rooms.find((entry) => entry.roomId === roomId) ?? null;
-  return { state: purged, room };
-}
-
-export function touchRoom(state: IndexState, roomId: string, expiresAt: number, now: number): IndexState {
-  const purged = purgeExpired(state, now);
-  return {
-    ...purged,
-    rooms: purged.rooms.map((room) => (room.roomId === roomId ? { ...room, expiresAt: Math.max(room.expiresAt, expiresAt) } : room)),
-  };
-}
-
-export function nextIndexAlarm(state: IndexState): number | null {
-  let soonest: number | null = null;
-  for (const room of state.rooms) {
-    if (soonest === null || room.expiresAt < soonest) soonest = room.expiresAt;
+/** Rooms of an index saved before they became rows. Anything that is not a room is left out. */
+export function legacyRooms(saved: unknown): IndexRoom[] {
+  const rooms = (saved as { rooms?: unknown } | null)?.rooms;
+  if (!Array.isArray(rooms)) return [];
+  const found: IndexRoom[] = [];
+  for (const item of rooms) {
+    if (!item || typeof item !== "object") continue;
+    const { roomId, createdAt, expiresAt, kind } = item as Record<string, unknown>;
+    if (typeof roomId !== "string" || !isRoomId(roomId) || typeof expiresAt !== "number" || !Number.isFinite(expiresAt)) continue;
+    const room: IndexRoom = { roomId, createdAt: typeof createdAt === "number" && Number.isFinite(createdAt) ? createdAt : 0, expiresAt };
+    if (kind === "group") room.kind = "group";
+    found.push(room);
   }
-  return soonest;
-}
-
-function purgeExpired(state: IndexState, now: number): IndexState {
-  return { ...state, rooms: state.rooms.filter((room) => room.expiresAt > now) };
+  return found;
 }
 
 function utcDay(now: number): string {
