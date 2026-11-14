@@ -88,8 +88,14 @@ const SMOOTHING = 0.6;
 const STALE_SAMPLES = 3;
 /** The current tier needs this share of its bitrate to be worth keeping. */
 const KEEP_BITRATE = 0.65;
-/** The next tier needs this much headroom before trying it. */
-const UP_BITRATE = 1.25;
+/**
+ * Headroom over the current tier's ceiling that allows trying the next one. It is measured against the tier
+ * in use, not the one above: a browser will not raise its estimate much past one and a half times what is
+ * really being sent, and the tier caps that. Asking for the next tier's bitrate up front could never be met
+ * after a real drop, and the call stayed on the low tier for good. If the link does not hold the step, the
+ * ladder comes back down and the next attempt waits longer.
+ */
+const UP_BITRATE = 1.3;
 /** An encoder that already cuts quality by itself cannot be on a good link. */
 const LIMITED_SCORE_CAP = 70;
 
@@ -172,7 +178,7 @@ export class AdaptiveController {
     const limited = smoothed.encoderLimit === "bandwidth" || smoothed.encoderLimit === "cpu";
     // Without any score there is no evidence the link is good. Bitrate alone only ever lowers the tier.
     const clean = score !== null && score >= SCORE_FLOOR[next] + UP_MARGIN && !limited;
-    const room = bitrate === undefined || bitrate >= this.profileOf(next).maxBitrate * UP_BITRATE;
+    const room = bitrate === undefined || bitrate >= this.profileOf(this.tier).maxBitrate * UP_BITRATE;
     if (!clean || !room) {
       this.goodStreak = 0;
       return this.hold(clean ? "needs-bitrate" : "hold");

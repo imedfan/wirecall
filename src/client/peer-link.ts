@@ -2,6 +2,7 @@ import { AdaptiveController, TIER_ORDER, type QualityTier, type TierProfile } fr
 import { preferredAudioCodecs, preferredVideoCodecs, type CodecCap } from "../shared/codecs";
 import { sanitizeIceServers, type IceServer } from "../shared/ice-servers";
 import { IceBuffer } from "../shared/ice-buffer";
+import { AudioCushion } from "../shared/audio-cushion";
 import { encodeIcePayload, parseIcePayload } from "../shared/protocol";
 import { shouldCreateOffer, shouldIgnoreOffer, type SignalingState } from "../shared/negotiation";
 import { summarizeStats, type StatCounters, type StatReport, type StatSummary } from "../shared/stats";
@@ -74,8 +75,6 @@ const MAX_REBUILDS = 4;
 const STATS_WARMUP_MS = 8_000;
 // Four missed reports in a row: the other side's tier is unknown again, not frozen at its last value.
 const PEER_QUALITY_STALE_MS = 9_000;
-// A little more buffer than the default smooths a jittery long-distance path without a delay people notice.
-const AUDIO_JITTER_TARGET_MS = 100;
 
 /**
  * The media connection to one other person: its RTCPeerConnection, the recovery of it, and the quality
@@ -113,6 +112,8 @@ export class PeerLink {
   private counters: StatCounters | undefined;
   private qualityChannel: RTCDataChannel | null = null;
   private peerTierAt = 0;
+  private audioReceiver: RTCRtpReceiver | null = null;
+  private cushion = new AudioCushion();
   private closed = false;
 
   constructor(
@@ -144,7 +145,9 @@ export class PeerLink {
 
   build(gen: number, iceServers: IceServer[]): void {
     this.drop();
-    const pc = new RTCPeerConnection({ iceServers: sanitizeIceServers(iceServers) });
+    // One transport for sound, picture and data from the first offer. Without it the browser gathers candidates
+    // and relay allocations three times over, and every one of them crosses the signaling socket.
+    const pc = new RTCPeerConnection({ iceServers: sanitizeIceServers(iceServers), bundlePolicy: "max-bundle" });
     this.pc = pc;
     this.pcGen = gen;
     // The last picture of the previous connection stays on screen, dimmed by the phase, until the new one delivers.
@@ -171,7 +174,7 @@ export class PeerLink {
       const stream = event.streams[0] ?? incoming;
       if (stream === incoming && !incoming.getTracks().includes(event.track)) incoming.addTrack(event.track);
       this.remoteStream = stream;
-      if (event.track.kind === "audio") cushionAudio(event.receiver);
+      if (event.track.kind === "audio") this.audioReceiver = event.receiver;
       this.host.linkMedia(this);
     });
     pc.addEventListener("iceconnectionstatechange", () => {
@@ -210,6 +213,8 @@ export class PeerLink {
     this.iceBuffer.reset();
     this.qualityChannel = null;
     this.peerTier = null;
+    this.audioReceiver = null;
+    this.cushion = new AudioCushion();
   }
 
   /** The other person has left, or the call is over. Nothing of this link runs after it. */
@@ -353,6 +358,9 @@ export class PeerLink {
     if (!this.alive(epoch) || this.pc !== pc) return;
     this.summary = summary;
     if (this.peerTier && Date.now() - this.peerTierAt > PEER_QUALITY_STALE_MS) this.peerTier = null;
+    // The voice gets a deeper buffer only while the browser has to invent sound to cover gaps.
+    const cushion = this.cushion.observe(summary.concealmentRatio);
+    if (cushion.changed && this.audioReceiver) cushionAudio(this.audioReceiver, cushion.targetMs);
     // The bandwidth estimate starts low and climbs for a few seconds. Judging it then lowers quality for no reason.
     if (!this.connectedAt || Date.now() - this.connectedAt < STATS_WARMUP_MS) return;
     const before = this.quality.current();
@@ -421,15 +429,18 @@ export class PeerLink {
   }
 
   private preferCodecs(pc: RTCPeerConnection): void {
-    const video = rtcCapabilities("video");
-    const audio = rtcCapabilities("audio");
     for (const transceiver of pc.getTransceivers()) {
       const kind = transceiver.sender.track?.kind ?? transceiver.receiver.track?.kind;
-      try {
-        if (kind === "video" && video.length > 0) transceiver.setCodecPreferences?.(video as RTCRtpCodec[]);
-        if (kind === "audio" && audio.length > 0) transceiver.setCodecPreferences?.(audio as RTCRtpCodec[]);
-      } catch {
-        // Safari can reject a preference list. The browser then keeps its own order.
+      if (kind !== "video" && kind !== "audio") continue;
+      // The list must come from what this browser can receive: one codec it can only send makes a current
+      // browser refuse the whole list. An older one takes the sender's list, so that is tried second.
+      for (const codecs of rtcCapabilities(kind)) {
+        try {
+          transceiver.setCodecPreferences?.(codecs as RTCRtpCodec[]);
+          break;
+        } catch {
+          // Safari can reject a preference list. The browser then keeps its own order.
+        }
       }
     }
   }
@@ -708,20 +719,30 @@ function requestKeyFrame(sender: RTCRtpSender | undefined): void {
   }
 }
 
-function cushionAudio(receiver: RTCRtpReceiver): void {
+/** Sets how much sound the receiver holds back before playing it. Null gives the choice back to the browser. */
+function cushionAudio(receiver: RTCRtpReceiver, targetMs: number | null): void {
   const target = receiver as unknown as Record<string, unknown>;
   try {
-    if ("jitterBufferTarget" in target) target.jitterBufferTarget = AUDIO_JITTER_TARGET_MS;
-    else if ("playoutDelayHint" in target) target.playoutDelayHint = AUDIO_JITTER_TARGET_MS / 1000;
+    if ("jitterBufferTarget" in target) target.jitterBufferTarget = targetMs;
+    else if ("playoutDelayHint" in target) target.playoutDelayHint = targetMs === null ? null : targetMs / 1000;
   } catch {
     // The browser keeps its own buffer.
   }
 }
 
-function rtcCapabilities(kind: "audio" | "video"): CodecCap[] {
-  const caps = RTCRtpSender.getCapabilities?.(kind);
-  if (!caps) return [];
-  return kind === "video" ? preferredVideoCodecs(caps.codecs) : preferredAudioCodecs(caps.codecs);
+/** Preference lists to try in order: from the receiver's codecs, then from the sender's. */
+function rtcCapabilities(kind: "audio" | "video"): CodecCap[][] {
+  const sources = [
+    typeof RTCRtpReceiver === "undefined" ? undefined : RTCRtpReceiver.getCapabilities?.(kind),
+    typeof RTCRtpSender === "undefined" ? undefined : RTCRtpSender.getCapabilities?.(kind),
+  ];
+  const lists: CodecCap[][] = [];
+  for (const caps of sources) {
+    if (!caps) continue;
+    const list = kind === "video" ? preferredVideoCodecs(caps.codecs) : preferredAudioCodecs(caps.codecs);
+    if (list.length > 0) lists.push(list);
+  }
+  return lists;
 }
 
 function iceUp(pc: RTCPeerConnection): boolean {

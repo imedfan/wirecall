@@ -667,6 +667,7 @@ export class CallSession {
       `Джиттер: ${ms(summary?.jitterMs)}`,
       `Битрейт: ${kbit(summary?.bitrate)}`,
       `Доступная полоса: ${kbit(summary?.availableOutgoingBitrate)}`,
+      `Кодек видео: ${summary?.codec ?? "неизвестно"}`,
       `Ограничение кодера: ${limitLabel(summary?.encoderLimit)}`,
       `Пропущенные кадры: ${percent(summary?.framesDroppedRatio)}`,
       `Восполнение звука: ${percent(summary?.concealmentRatio)}`,
